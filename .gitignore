@@ -1,0 +1,25 @@
+# Node modules
+node_modules/
+
+# Logs
+logs
+*.log
+npm-debug.log*
+
+# Dependency directories
+jspm_packages/
+
+# dotenv environment files
+.env
+.env.*
+
+# TypeScript output
+dist/
+build/
+*.tsbuildinfo
+
+# OS metadata
+.DS_Store
+
+# VSCode settings
+.vscode/
