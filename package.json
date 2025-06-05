@@ -1,0 +1,22 @@
+{
+  "name": "assetdidcomm",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "jose": "^6.0.11",
+    "tsx": "^4.19.4",
+    "uuid": "^11.1.0",
+    "message-module-js": "file:../adc-messaging-module/wasm/node"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.29"
+  }
+}
