@@ -11,10 +11,14 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "@polkadot/extension-dapp": "^0.59.2",
+    "@polkadot/util": "^13.5.1",
+    "@polkadot/util-crypto": "^13.5.1",
+    "dotenv": "^16.5.0",
     "jose": "^6.0.11",
+    "message-module-js": "file:../adc-messaging-module/wasm/node",
     "tsx": "^4.19.4",
-    "uuid": "^11.1.0",
-    "message-module-js": "file:../adc-messaging-module/wasm/node"
+    "uuid": "^11.1.0"
   },
   "devDependencies": {
     "@types/node": "^22.15.29"

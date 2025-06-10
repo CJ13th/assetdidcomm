@@ -1,20 +1,32 @@
-// examples/sendAndReceiveMessage.ts
 import { AssetDidCommClient } from '../src/client';
-import { MockStorageAdapter, MockDidResolver, MockSigner } from '../src/adapters/mock';
+import { CrustStorageAdapter } from '../src/storage/crust';
+import { KeyringSigner } from '../src/signers/keyring';
+import { MockDidResolver } from '../src/signers/mock';
+import { cryptoWaitReady } from '@polkadot/util-crypto'; // <-- 1. Import the initializer
+
+const SENDER_SEED = '//Alice';
+const RECIPIENT_DID = 'did:example:receiver';
 
 async function main() {
+    await cryptoWaitReady();
+    console.log('Crypto WASM initialized.');
+    // -------------------
+
+    // Now it is safe to create the signer
+    const senderSigner = new KeyringSigner(SENDER_SEED);
+
     const config = {
-        storageAdapter: new MockStorageAdapter(),
+        storageAdapter: new CrustStorageAdapter(senderSigner),
         didResolver: new MockDidResolver(),
-        signer: new MockSigner("did:example:sender"), // Sender's DID
+        signer: senderSigner,
     };
 
     const client = new AssetDidCommClient(config);
 
+    // The rest of your script remains unchanged...
     const entityId = "testAsset001";
     const bucketId = "mainChatBucket";
-    const recipientDid = "did:example:receiver";
-    const originalMessageContent = "Hello, this is a test message for send and receive! " + Date.now();
+    const originalMessageContent = "Hello from KeyringSigner in Node.js! " + Date.now();
 
     let storageIdForReceipt: string | null = null;
 
@@ -23,20 +35,15 @@ async function main() {
         const sendResult = await client.sendDirectMessage(
             entityId,
             bucketId,
-            recipientDid,
+            RECIPIENT_DID,
             originalMessageContent
         );
         console.log("Message sent successfully:", sendResult);
-        storageIdForReceipt = sendResult.storageIdentifier; // Get the CID for decryption
-
-        // Basic check of the JWE structure (optional)
-        if (sendResult.jwe.split('.').length !== 5) {
-            console.error("Generated JWE does not look like a compact JWE!");
-        }
+        storageIdForReceipt = sendResult.storageIdentifier;
 
     } catch (error) {
         console.error("Error sending message:", error);
-        return; // Stop if sending failed
+        return;
     }
 
     if (!storageIdForReceipt) {
@@ -46,8 +53,6 @@ async function main() {
 
     try {
         console.log(`\n--- Receiving Message (from CID: ${storageIdForReceipt}) ---`);
-        // Simulate a different client instance or context that would be "receiving"
-        // For this test, we use the same client instance but it will use the MOCK_SKB_JWK
         const decryptedMessage = await client.receiveMessageByCid(
             entityId,
             bucketId,
@@ -63,10 +68,6 @@ async function main() {
         } else {
             console.error("FAILURE: Decrypted message content does NOT match original.");
         }
-        // You can add more assertions here (e.g., check 'from', 'to', 'id' fields)
-        // console.log("Original 'from':", client.config.signer.getAddress());
-        // console.log("Decrypted 'from':", decryptedMessage.from);
-
     } catch (error) {
         console.error("Error receiving or decrypting message:", error);
     }
