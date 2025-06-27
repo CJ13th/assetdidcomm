@@ -1,11 +1,11 @@
+import type { ResolutionResult, Did } from '@kiltprotocol/types';
+
+
 export interface StorageAdapter {
     upload: (data: Uint8Array | string) => Promise<string>; // Returns CID/URL
     download: (identifier: string) => Promise<Uint8Array>;
 }
 
-export interface DidResolver {
-    resolve: (did: string) => Promise<any>; // Simplified, use actual DID ResolutionResult type
-}
 
 export interface SignerPayloadRaw {
     address: string;
@@ -30,4 +30,13 @@ export interface AssetDidCommClientConfig {
     didResolver: DidResolver; // To fetch DIDs for keys
     signer: Signer; // To sign transactions
     // Potentially default KILT API endpoint if not covered by didResolver
+}
+
+export type DidResolver = (did: Did) => Promise<ResolutionResult>;
+
+export interface AssetDidCommClientConfig {
+    storageAdapter: StorageAdapter;
+    rpcEndpoint?: string;
+    didResolver: DidResolver;
+    signer: Signer;
 }

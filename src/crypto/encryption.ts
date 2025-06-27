@@ -93,3 +93,63 @@ export async function decryptJWE(
         throw new Error('Failed to decrypt message due to an unknown error.');
     }
 }
+
+
+
+/**
+ * Encrypts a plaintext payload for multiple recipients using General JWE JSON Serialization.
+ * This is used for key-sharing messages.
+ *
+ * @param plaintext The plaintext to encrypt.
+ * @param recipientPublicKeys An array of recipient public keys in JWK format.
+ * @returns The JWE as a JSON object (General JWE Serialization).
+ * @throws Error if encryption fails.
+ */
+export async function encryptJWEForMultipleRecipients(
+    plaintext: Uint8Array,
+    recipientPublicKeys: JWK[]
+): Promise<jose.GeneralJWE> {
+    try {
+        const generalEncrypt = new jose.GeneralEncrypt(plaintext);
+        generalEncrypt.setProtectedHeader({ alg: JWE_ALG, enc: JWE_ENC });
+
+        for (const jwk of recipientPublicKeys) {
+            const publicKey = await jose.importJWK(jwk, JWE_ALG);
+            generalEncrypt.addRecipient(publicKey);
+        }
+
+        return await generalEncrypt.encrypt();
+    } catch (error) {
+        console.error('General JWE Encryption failed:', error);
+        if (error instanceof Error) {
+            throw new Error(`Failed to encrypt message for multiple recipients: ${error.message}`);
+        }
+        throw new Error('Failed to encrypt message for multiple recipients due to an unknown error.');
+    }
+}
+
+// You will also need a corresponding decryption function
+/**
+ * Decrypts a General JWE JSON Serialization object.
+ *
+ * @param jwe The General JWE object.
+ * @param privateKeyJwk The recipient's private key in JWK format.
+ * @returns The decrypted plaintext as a Uint8Array.
+ * @throws Error if decryption fails.
+ */
+export async function decryptGeneralJWE(
+    jwe: jose.GeneralJWE,
+    privateKeyJwk: JWK
+): Promise<Uint8Array> {
+    try {
+        const privateKey = await jose.importJWK(privateKeyJwk, JWE_ALG);
+        const { plaintext } = await jose.generalDecrypt(jwe, privateKey);
+        return plaintext;
+    } catch (error) {
+        console.error('General JWE Decryption failed:', error);
+        if (error instanceof Error) {
+            throw new Error(`Failed to decrypt general JWE message: ${error.message}`);
+        }
+        throw new Error('Failed to decrypt general JWE message due to an unknown error.');
+    }
+}

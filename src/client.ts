@@ -1,17 +1,23 @@
 // src/client.ts
 import { AssetDidCommClientConfig, Signer, StorageAdapter, DidResolver } from './config'; // Assuming config.ts exists
 import { ApiPromise, WsProvider } from '@polkadot/api'; // Add to imports
+import type { SubmittableExtrinsic } from '@polkadot/api/types';
+import type { ISubmittableResult, IEventRecord, IEvent } from '@polkadot/types/types';
+import type { ResolutionResult, Did } from '@kiltprotocol/types';
+
 import { createDirectMessage } from 'message-module-js';
 import { encryptJWE, calculateSha256Digest, decryptJWE } from './crypto/encryption';
+import { createKeySharingMessage } from 'message-module-js';
+import { encryptJWEForMultipleRecipients, decryptGeneralJWE } from './crypto/encryption';
 import { MOCK_PKB_JWK, MOCK_SKB_JWK } from './crypto/keys'; // Using the mock PKB for now
 import type { JWK } from 'jose';
 import { v4 as uuidv4 } from 'uuid';
+import { KeyringSigner } from './signers/keyring';
 
 
 export class AssetDidCommClient {
     private config: AssetDidCommClientConfig;
-    private polkadotApi?: ApiPromise; // Will be initialized if rpcEndpoint is provided
-
+    public polkadotApi?: ApiPromise;
     constructor(config: AssetDidCommClientConfig) {
         if (!config.storageAdapter) {
             throw new Error("StorageAdapter is required in config.");
@@ -24,17 +30,180 @@ export class AssetDidCommClient {
         }
         this.config = config;
 
-        if (config.rpcEndpoint) {
-            this.initializePolkadotApi(config.rpcEndpoint);
+    }
+
+    public async connect(): Promise<void> {
+        if (this.polkadotApi && this.polkadotApi.isConnected) {
+            console.log("Polkadot API is already connected.");
+            return;
+        }
+
+        if (!this.config.rpcEndpoint) {
+            throw new Error("Cannot connect: rpcEndpoint is not configured.");
+        }
+
+        const provider = new WsProvider(this.config.rpcEndpoint);
+        this.polkadotApi = await ApiPromise.create({ provider });
+
+        console.log(`Polkadot API initialized and connected to ${this.config.rpcEndpoint} for signer ${this.config.signer.getAddress()}`);
+
+        this.polkadotApi.on('disconnected', () => console.warn(`API disconnected for ${this.config.signer.getAddress()}`));
+        this.polkadotApi.on('error', (error) => console.error(`API error for ${this.config.signer.getAddress()}:`, error));
+    }
+
+    public async disconnect(): Promise<void> {
+        if (this.polkadotApi && this.polkadotApi.isConnected) {
+            await this.polkadotApi.disconnect();
+            console.log(`API disconnected for ${this.config.signer.getAddress()}`);
         }
     }
 
-    private async initializePolkadotApi(rpcEndpoint: string): Promise<void> {
-        const provider = new WsProvider(rpcEndpoint);
-        this.polkadotApi = await ApiPromise.create({ provider });
-        console.log(`Polkadot API initialized and connected to ${rpcEndpoint}`);
-        this.polkadotApi.on('disconnected', () => console.warn('Polkadot API disconnected'));
-        this.polkadotApi.on('error', (error) => console.error('Polkadot API error:', error));
+    /**
+ * A generic helper to submit an extrinsic and wait for a specific event.
+ *
+ * @param extrinsic The SubmittableExtrinsic to send.
+ * @param eventFinder A function that takes an event and returns true if it's the one we're looking for.
+ * @param eventValidator A function that validates the found event's data and returns true if it's the correct instance.
+ * @returns A promise that resolves with the found event and the transaction hash.
+ * @template T - The expected type of the data extracted from the event.
+ */
+    private _submitAndWatch<T>( // Removed async from the function signature
+        extrinsic: SubmittableExtrinsic<'promise'>,
+        eventFinder: (event: IEvent<any>) => boolean,
+        eventValidator: (event: IEventRecord<any>) => T | null
+    ): Promise<{ data: T; txHash: string }> {
+        if (!this.polkadotApi) {
+            return Promise.reject(new Error("Polkadot API not initialized."));
+        }
+        if (!(this.config.signer instanceof KeyringSigner)) {
+            return Promise.reject(new Error("This operation currently requires a KeyringSigner."));
+        }
+        const keypair = this.config.signer.getKeypair();
+
+        return new Promise(async (resolve, reject) => {
+            try {
+                const unsubscribe = await extrinsic.signAndSend(keypair, (result: any) => {
+                    console.log(`Transaction status: ${result.status.type}`);
+
+                    if (result.status.isInBlock || result.status.isFinalized) {
+                        const foundEvent = result.events.find(({ event }) => eventFinder(event));
+
+                        if (foundEvent) {
+                            const validatedData = eventValidator(foundEvent);
+                            if (validatedData !== null) {
+                                console.log(`✅ Event found and validated: ${foundEvent.event.section}.${foundEvent.event.method}`);
+                                unsubscribe();
+                                resolve({
+                                    data: validatedData,
+                                    txHash: result.txHash.toHex(),
+                                });
+                                return;
+                            }
+                        }
+
+                        if (result.status.isFinalized) {
+                            unsubscribe();
+                            // If it finalizes without our event, something went wrong.
+                            reject(new Error("Transaction finalized, but the expected event was not found or was invalid."));
+                        }
+                    } else if (result.isError) {
+                        let errorMessage = "Transaction submission error.";
+                        if (result.dispatchError?.isModule) {
+                            const decoded = this.polkadotApi!.registry.findMetaError(result.dispatchError.asModule);
+                            errorMessage = `Transaction failed: ${decoded?.name} - ${decoded?.docs.join(' ')}`;
+                        }
+                        unsubscribe();
+                        reject(new Error(errorMessage));
+                    }
+                });
+            } catch (error) {
+                reject(error);
+            }
+        });
+    }
+
+
+
+    /**
+     * Creates a new Entity (Namespace) on the chain.
+     * The transaction is signed by the client's configured signer, who becomes the initial manager.
+     * @param entityId The unique identifier for the new entity.
+     * @param metadata An object representing the entity's metadata.
+     * @returns The transaction hash.
+     */
+    public async createEntity(entityId: number, metadata: object = {}): Promise<string> {
+        if (!this.polkadotApi) throw new Error("Polkadot API not initialized.");
+
+        const extrinsic = this.polkadotApi.tx.buckets.createNamespace(entityId, metadata);
+
+        const { txHash } = await this._submitAndWatch<{ namespaceId: string }>(
+            extrinsic,
+            (event) => this.polkadotApi!.events.buckets.NamespaceCreated.is(event),
+            (eventRecord) => {
+                const [eventNamespaceId] = eventRecord.event.data;
+                if ((eventNamespaceId as any).toNumber() === entityId) {
+                    return { namespaceId: (eventNamespaceId as any).toNumber() };
+                }
+                return null; // Validation failed
+            }
+        );
+
+        return txHash;
+    }
+
+    /**
+     * Creates a new Bucket within an existing Entity.
+     * The transaction is signed by a manager of the entity.
+     * @param entityId The ID of the parent entity.
+     * @param metadata An object representing the bucket's metadata.
+     * @returns The transaction hash and the new bucket's ID.
+     */
+    public async createBucket(entityId: number, metadata: object = {}): Promise<{ txHash: string, bucketId: number }> {
+        if (!this.polkadotApi) throw new Error("Polkadot API not initialized.");
+
+        const extrinsic = this.polkadotApi.tx.buckets.createBucket(entityId, metadata);
+
+        const { data, txHash } = await this._submitAndWatch<{ bucketId: number }>(
+            extrinsic,
+            (event) => this.polkadotApi!.events.buckets.BucketCreated.is(event),
+            (eventRecord) => {
+                const [eventNamespaceId, eventBucketId] = eventRecord.event.data;
+                if ((eventNamespaceId as any).toNumber() === entityId) {
+                    return { bucketId: (eventBucketId as any).toNumber() };
+                }
+                return null; // Validation failed
+            }
+        );
+
+        return { txHash, bucketId: data.bucketId };
+    }
+
+    /**
+     * Sets or rotates the public key (PKB) for a bucket, making it writable.
+     * Must be called by an Admin of the bucket.
+     * @param entityId The ID of the parent entity.
+     * @param bucketId The ID of the bucket.
+     * @param publicKeyJwk The new public key in JWK format.
+     * @returns The transaction hash.
+     */
+    public async setBucketPublicKey(entityId: number, bucketId: number, publicKeyJwk: JWK): Promise<string> {
+        if (!this.polkadotApi) throw new Error("Polkadot API not initialized.");
+
+        const keyId = publicKeyJwk.kid || JSON.stringify(publicKeyJwk);
+        const extrinsic = this.polkadotApi.tx.buckets.resumeWriting(entityId, bucketId, keyId);
+
+        const { txHash } = await this._submitAndWatch(
+            extrinsic,
+            (event) => this.polkadotApi!.events.buckets.BucketWritableWithKey.is(event),
+            (eventRecord) => {
+                const [, eventBucketId, eventKey] = eventRecord.event.data;
+                if ((eventBucketId as any).toNumber() === bucketId && eventKey.toString() === keyId) {
+                    return { success: true };
+                }
+                return null;
+            }
+        );
+        return txHash;
     }
 
     /**
@@ -50,8 +219,8 @@ export class AssetDidCommClient {
      *          the storage identifier (CID), and the JWE string.
      */
     public async sendDirectMessage(
-        entityId: string,
-        bucketId: string,
+        entityId: number,
+        bucketId: number,
         recipientDid: string,
         messageContent: string,
         tag: string = "direct_message_v1" // Example default tag
@@ -143,7 +312,7 @@ export class AssetDidCommClient {
      * @param bucketId The ID of the bucket.
      * @returns The PKB in JWK format, or null if not found/not writable.
      */
-    private async fetchBucketPublicKey(entityId: string, bucketId: string): Promise<JWK | null> {
+    private async fetchBucketPublicKey(entityId: number, bucketId: number): Promise<JWK | null> {
         console.warn(`Fetching PKB for entity ${entityId}, bucket ${bucketId} - MOCK IMPLEMENTATION`);
         // TODO: Implement actual pallet query
         // Example (pseudo-code for pallet query):
@@ -152,7 +321,7 @@ export class AssetDidCommClient {
         //   return null;
         // }
         // try {
-        //   const bucketInfoRaw = await this.polkadotApi.query.didCommVault.buckets(entityId, bucketId);
+        //   const bucketInfoRaw = await this.polkadotApi.query.bucket.buckets(entityId, bucketId);
         //   if (bucketInfoRaw.isNone) return null;
         //   const bucketInfo = bucketInfoRaw.unwrap();
         //   if (bucketInfo.status.isWritable) {
@@ -167,31 +336,37 @@ export class AssetDidCommClient {
         return MOCK_PKB_JWK; // Return our hardcoded mock key for now
     }
 
-    /**
-     * Submits message metadata to the Substrate pallet.
-     * @param entityId The ID of the entity.
-     * @param bucketId The ID of the bucket.
-     * @param messageData The metadata to submit (reference, digest, tag).
-     * @returns The transaction hash or an on-chain identifier for the message.
-     */
     private async submitToPallet(
-        entityId: string,
-        bucketId: string,
-        messageData: { reference: string; digest: string; tag: string }
+        entityId: number,
+        bucketId: number,
+        messageData: { reference: string; tag: string; metadata?: object }
     ): Promise<string> {
-        console.warn(
-            `Submitting to pallet for entity ${entityId}, bucket ${bucketId} with data:`,
-            JSON.stringify(messageData),
-            "- MOCK IMPLEMENTATION"
-        );
-        // TODO: Implement actual extrinsic submission using Polkadot.js API and the signer
-        // const extrinsic = this.polkadotApi.tx.didCommVault.write(entityId, bucketId, messageData.reference, messageData.digest, messageData.tag);
-        // const signedExtrinsic = await extrinsic.signAsync(this.config.signer.getAddress(), { signer: this.config.signer }); // Assuming signer has signPayload
-        // const txHash = await signedExtrinsic.send();
-        // return txHash.toHex();
+        if (!this.polkadotApi) throw new Error("Polkadot API not initialized.");
 
-        // Mocking a transaction hash
-        return `0x${Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString('hex')}_mock_tx`;
+        const messageInput = {
+            reference: messageData.reference,
+            tag: messageData.tag,
+            metadata: messageData.metadata || {}
+        };
+
+        const extrinsic = this.polkadotApi.tx.buckets.write(entityId, bucketId, messageInput);
+
+        // In a `write` operation, we might just care that it's finalized, 
+        // but watching for the event is more robust.
+        const { txHash } = await this._submitAndWatch(
+            extrinsic,
+            (event) => this.polkadotApi!.events.buckets.NewMessage.is(event),
+            (eventRecord) => {
+                // We could validate the message ID if we knew it beforehand,
+                // but for now, just confirming the event for the correct bucket is enough.
+                const [eventBucketId] = eventRecord.event.data;
+                if ((eventBucketId as any).toNumber() === bucketId) {
+                    return { success: true };
+                }
+                return null;
+            }
+        );
+        return txHash;
     }
 
     /**
@@ -277,4 +452,192 @@ export class AssetDidCommClient {
         return MOCK_SKB_JWK;
     }
 
+    /**
+     * Creates and distributes a bucket's secret key (SKB) to a list of readers.
+     * This creates a special key-sharing message, encrypts it for all readers
+     * (and the bucket's own new public key), and writes it to the bucket.
+     *
+     * @param entityId The parent entity ID.
+     * @param bucketId The bucket ID.
+     * @param bucketKeys The key pair (PKB/SKB) for the bucket.
+     * @param readerDids A list of DIDs for the users who should receive the key.
+     * @returns The on-chain message ID (tx hash) and the storage identifier (CID).
+     */
+    public async shareBucketKey(
+        entityId: number,
+        bucketId: number,
+        bucketKeys: { publicJwk: JWK, secretJwk: JWK },
+        readerDids: Did[]
+    ): Promise<{ messageIdOnChain: string, storageIdentifier: string }> {
+        console.log(`Sharing bucket key for bucket ${bucketId} with ${readerDids.length} readers.`);
+
+        const skbForWasm = bucketKeys.secretJwk;
+        if (!skbForWasm.kty || !skbForWasm.crv || !skbForWasm.x || !skbForWasm.y || !skbForWasm.d || !skbForWasm.use) {
+            throw new Error("The generated secret JWK is missing required properties.");
+        }
+
+        const wasmCompatibleKey = {
+            kty: skbForWasm.kty,
+            crv: skbForWasm.crv,
+            x: skbForWasm.x,
+            y: skbForWasm.y,
+            d: skbForWasm.d,
+            use: skbForWasm.use, // Correctly map 'use' to '_use'
+            kid: skbForWasm.kid || `skb-for-bucket-${bucketId}`,
+        };
+
+        // 1. Create the DIDComm Key-Sharing Message (using WASM module)
+        // The spec has latestKey/previousKeys, but the module has `keys`. We adapt.
+        // The key being shared is the *secret key* of the bucket.
+        const keySharingMsgString = createKeySharingMessage({
+            id: uuidv4(),
+            from: this.config.signer.getAddress(),
+            to: readerDids,
+            keys: [
+                wasmCompatibleKey
+            ]
+        });
+        const keySharingMsgObject = JSON.parse(keySharingMsgString);
+        const plaintextBytes = new TextEncoder().encode(JSON.stringify(keySharingMsgObject));
+        console.log("Constructed Key-Sharing Message:", keySharingMsgObject);
+
+        // 2. Resolve Reader DIDs to get their public keys for encryption
+        const recipientKeys: JWK[] = [bucketKeys.publicJwk]; // Bucket can always decrypt its own key messages
+        for (const did of readerDids) {
+            // In a real scenario, you'd resolve the DID and get the keyAgreement key
+            const resolutionResult = await this.config.didResolver(did);
+
+            // This is a simplification; you'd need to find the correct key from the DID doc
+            const readerPk = didDoc.didDocument.keyAgreement[0].publicKeyJwk;
+            recipientKeys.push(readerPk);
+        }
+        // For this example, we'll use a mock key for the reader 'Charlie'
+        recipientKeys.push({ kty: 'EC', crv: 'P-256', x: 'charlie_pub_x', y: 'charlie_pub_y' }); // Mock Charlie's Public Key
+
+        // 3. Encrypt for multiple recipients
+        const jweObject = await encryptJWEForMultipleRecipients(plaintextBytes, recipientKeys);
+        const jweString = JSON.stringify(jweObject);
+
+        // 4. Upload to storage
+        const storageIdentifier = await this.config.storageAdapter.upload(jweString);
+        console.log(`Uploaded key-sharing message to: ${storageIdentifier}`);
+
+        // 5. Submit to pallet with a special tag
+        const messageIdOnChain = await this.submitToPallet(entityId, bucketId, { // No destructuring
+            reference: storageIdentifier,
+            tag: "didcomm/key-sharing-v1",
+        });
+
+        return { messageIdOnChain, storageIdentifier };
+    }
+
+    /**
+     * Retrieves and decrypts the bucket's secret key (SKB) from a key-sharing message.
+     *
+     * @param bucketId The bucket to get the key for.
+     * @param readerPrivateKeyJwk The private key of the reader trying to access the SKB.
+     * @returns The bucket's secret key (SKB) in JWK format.
+     */
+    public async retrieveBucketSecretKey(bucketId: number, readerPrivateKeyJwk: JWK): Promise<JWK> {
+        if (!this.polkadotApi) throw new Error("Polkadot API not initialized.");
+
+        console.log(`Attempting to retrieve SKB for bucket ${bucketId} as a reader.`);
+
+        // 1. Query the pallet for key-sharing messages in the bucket.
+        // This is a simplified query. A real implementation would need more robust filtering.
+        const messageEntries = await this.polkadotApi.query.buckets.messages.entries(bucketId);
+        const keySharingMessages = messageEntries
+            .filter(([, value]) => (value as any).isSome) // Ensure the Option has a value
+            .map(([key, value]) => {
+                const unwrappedValue = (value as any).unwrap(); // Cast to 'any' to access unwrap()
+                const messageData = unwrappedValue.toPrimitive(); // Use toPrimitive() for a plain JS object
+
+                // The message ID is the second argument in the double map storage key
+                const messageId = (key.args[1] as any).toNumber(); // Cast to 'any' to access toNumber()
+
+                return { ...messageData, id: messageId };
+            })
+            .filter(msg => msg.tag === "didcomm/key-sharing-v1");
+
+        if (keySharingMessages.length === 0) {
+            throw new Error(`No key-sharing message found in bucket ${bucketId}.`);
+        }
+
+        // For simplicity, we take the latest one.
+        const keyMessageInfo = keySharingMessages.sort((a, b) => b.id - a.id)[0];
+        console.log(`Found key-sharing message at CID: ${keyMessageInfo.reference}`);
+
+        // 2. Download the JWE from storage
+        const jweBytes = await this.config.storageAdapter.download(keyMessageInfo.reference);
+        const jweObject = JSON.parse(new TextDecoder().decode(jweBytes));
+
+        // 3. Decrypt using the reader's private key
+        const decryptedBytes = await decryptGeneralJWE(jweObject, readerPrivateKeyJwk);
+        const decryptedMsg = JSON.parse(new TextDecoder().decode(decryptedBytes));
+
+        console.log("Successfully decrypted key-sharing message:", decryptedMsg);
+
+        // 4. Extract the key
+        if (!decryptedMsg.body.keys || decryptedMsg.body.keys.length === 0) {
+            throw new Error("Decrypted key-sharing message has no keys.");
+        }
+        const skb = decryptedMsg.body.keys[0]; // Assuming the first key is the SKB
+
+        return skb;
+    }
+
+    /**
+ * Sets an Admin for a specific bucket.
+ * Must be called by a Manager of the parent entity.
+ * @param entityId The ID of the parent entity.
+ * @param bucketId The ID of the bucket.
+ * @param adminDid The DID of the account to be made an admin.
+ * @returns The transaction hash.
+ */
+    public async addAdmin(entityId: number, bucketId: number, adminDid: string): Promise<string> {
+        if (!this.polkadotApi) throw new Error("Polkadot API not initialized.");
+
+        const extrinsic = this.polkadotApi.tx.buckets.addAdmin(entityId, bucketId, adminDid);
+
+        const { txHash } = await this._submitAndWatch(
+            extrinsic,
+            (event) => this.polkadotApi!.events.buckets.AdminAdded.is(event),
+            (eventRecord) => {
+                const [, eventBucketId, eventAdmin] = eventRecord.event.data;
+                if ((eventBucketId as any).toNumber() === bucketId && eventAdmin.toString() === adminDid) {
+                    return { success: true }; // We just need confirmation
+                }
+                return null;
+            }
+        );
+        return txHash;
+    }
+
+    /**
+     * Adds a Contributor to a specific bucket.
+     * Must be called by an Admin of the bucket.
+     * @param entityId The ID of the parent entity.
+     * @param bucketId The ID of the bucket.
+     * @param contributorDid The DID of the account to be made a contributor.
+     * @returns The transaction hash.
+     */
+    public async addContributor(entityId: number, bucketId: number, contributorDid: string): Promise<string> {
+        if (!this.polkadotApi) throw new Error("Polkadot API not initialized.");
+
+        // Note: The pallet extrinsic is grantWriteAccess, but we listen for ContributorAdded event
+        const extrinsic = this.polkadotApi.tx.buckets.grantWriteAccess(entityId, bucketId, contributorDid);
+
+        const { txHash } = await this._submitAndWatch(
+            extrinsic,
+            (event) => this.polkadotApi!.events.buckets.ContributorAdded.is(event),
+            (eventRecord) => {
+                const [, eventBucketId, eventContributor] = eventRecord.event.data;
+                if ((eventBucketId as any).toNumber() === bucketId && eventContributor.toString() === contributorDid) {
+                    return { success: true };
+                }
+                return null;
+            }
+        );
+        return txHash;
+    }
 }
