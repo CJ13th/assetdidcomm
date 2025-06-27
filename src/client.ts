@@ -1,5 +1,6 @@
 // src/client.ts
 import { AssetDidCommClientConfig, Signer, StorageAdapter, DidResolver } from './config'; // Assuming config.ts exists
+import { ApiPromise, WsProvider } from '@polkadot/api'; // Add to imports
 import { createDirectMessage } from 'message-module-js';
 import { encryptJWE, calculateSha256Digest, decryptJWE } from './crypto/encryption';
 import { MOCK_PKB_JWK, MOCK_SKB_JWK } from './crypto/keys'; // Using the mock PKB for now
@@ -9,7 +10,7 @@ import { v4 as uuidv4 } from 'uuid';
 
 export class AssetDidCommClient {
     private config: AssetDidCommClientConfig;
-    // private polkadotApi?: ApiPromise; // Will be initialized if rpcEndpoint is provided
+    private polkadotApi?: ApiPromise; // Will be initialized if rpcEndpoint is provided
 
     constructor(config: AssetDidCommClientConfig) {
         if (!config.storageAdapter) {
@@ -23,20 +24,18 @@ export class AssetDidCommClient {
         }
         this.config = config;
 
-        // Optional: Initialize Polkadot API if rpcEndpoint is provided
-        // if (config.rpcEndpoint) {
-        //   this.initializePolkadotApi(config.rpcEndpoint);
-        // }
+        if (config.rpcEndpoint) {
+            this.initializePolkadotApi(config.rpcEndpoint);
+        }
     }
 
-    // private async initializePolkadotApi(rpcEndpoint: string): Promise<void> {
-    //   // import { ApiPromise, WsProvider } from '@polkadot/api'; // Add to imports
-    //   // const provider = new WsProvider(rpcEndpoint);
-    //   // this.polkadotApi = await ApiPromise.create({ provider });
-    //   // console.log(`Polkadot API initialized and connected to ${rpcEndpoint}`);
-    //   // this.polkadotApi.on('disconnected', () => console.warn('Polkadot API disconnected'));
-    //   // this.polkadotApi.on('error', (error) => console.error('Polkadot API error:', error));
-    // }
+    private async initializePolkadotApi(rpcEndpoint: string): Promise<void> {
+        const provider = new WsProvider(rpcEndpoint);
+        this.polkadotApi = await ApiPromise.create({ provider });
+        console.log(`Polkadot API initialized and connected to ${rpcEndpoint}`);
+        this.polkadotApi.on('disconnected', () => console.warn('Polkadot API disconnected'));
+        this.polkadotApi.on('error', (error) => console.error('Polkadot API error:', error));
+    }
 
     /**
      * Sends a direct message to a recipient within a specific asset entity's bucket.
