@@ -3,7 +3,7 @@ import { AssetDidCommClientConfig, Signer, StorageAdapter, DidResolver } from '.
 import { ApiPromise, WsProvider } from '@polkadot/api'; // Add to imports
 import type { SubmittableExtrinsic } from '@polkadot/api/types';
 import type { ISubmittableResult, IEventRecord, IEvent } from '@polkadot/types/types';
-import type { ResolutionResult, Did } from '@kiltprotocol/types';
+import type { ResolutionResult, Did, DidDocument } from '@kiltprotocol/types';
 
 import { createDirectMessage } from 'message-module-js';
 import { encryptJWE, calculateSha256Digest, decryptJWE } from './crypto/encryption';
@@ -507,8 +507,12 @@ export class AssetDidCommClient {
             // In a real scenario, you'd resolve the DID and get the keyAgreement key
             const resolutionResult = await this.config.didResolver(did);
 
+            const didDocument = resolutionResult.didDocument;
+
+            if (!didDocument) continue;
+
             // This is a simplification; you'd need to find the correct key from the DID doc
-            const readerPk = didDoc.didDocument.keyAgreement[0].publicKeyJwk;
+            const readerPk = didDocument.? keyAgreement[0].publicKeyJwk;
             recipientKeys.push(readerPk);
         }
         // For this example, we'll use a mock key for the reader 'Charlie'
