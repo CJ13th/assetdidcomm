@@ -1,4 +1,4 @@
-import 'dotenv/config'; // <-- Load environment variables from .env file
+import 'dotenv/config';
 import { AssetDidCommClient } from '../src/client';
 import { PinataStorageAdapter } from '../src/storage/pinata';
 import { KeyringSigner } from '../src/signers/keyring';
@@ -13,6 +13,7 @@ const RECIPIENT_DID = 'did:example:charlie';
 // Load the Pinata JWT from environment variables for security.
 const PINATA_JWT = process.env.PINATA_JWT;
 const PINATA_GATEWAY = process.env.PINATA_GATEWAY || 'orange-objective-gerbil-959.mypinata.cloud';
+const RPC_ENDPOINT = process.env.RPC_ENDPOINT || 'wss://fraa-flashbox-4654-rpc.a.stagenet.tanssi.network';
 
 async function main() {
     // Check for the required environment variable.
@@ -34,13 +35,16 @@ async function main() {
         storageAdapter: new PinataStorageAdapter({ jwt: PINATA_JWT, publicGateway: `https://${PINATA_GATEWAY}/ipfs` }),
         didResolver: new MockDidResolver(),
         signer: senderSigner,
+        rpcEndpoint: RPC_ENDPOINT
+
     };
 
     const client = new AssetDidCommClient(config);
+    await client.connect();
 
     // --- Test Logic ---
-    const entityId = "pinataTestAsset";
-    const bucketId = "testBucket";
+    const entityId = Math.floor(100000 * Math.random());
+    const bucketId = Math.floor(100000 * Math.random());
     const originalMessageContent = "This message was stored on Pinata! " + Date.now();
     let storageIdForReceipt: string | null = null;
 

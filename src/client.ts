@@ -380,8 +380,8 @@ export class AssetDidCommClient {
     * @throws Error if download or decryption fails.
     */
     public async receiveMessageByCid(
-        entityId: string,
-        bucketId: string,
+        entityId: number,
+        bucketId: number,
         storageIdentifier: string
     ): Promise<Record<string, any>> { // Return type is a generic object, could be more specific
         console.log(`Attempting to receive and decrypt message from ${storageIdentifier} for entity ${entityId}, bucket ${bucketId}`);
@@ -439,7 +439,7 @@ export class AssetDidCommClient {
      * @param bucketId The ID of the bucket.
      * @returns The SKB in JWK format, or null if not found/accessible.
      */
-    private async fetchBucketSecretKey(entityId: string, bucketId: string): Promise<JWK | null> {
+    private async fetchBucketSecretKey(entityId: number, bucketId: number): Promise<JWK | null> {
         console.warn(
             `Fetching SKB for entity ${entityId}, bucket ${bucketId} - MOCK IMPLEMENTATION. ` +
             `This is highly insecure for a real system. Using MOCK_SKB_JWK.`
@@ -467,8 +467,8 @@ export class AssetDidCommClient {
         entityId: number,
         bucketId: number,
         bucketKeys: { publicJwk: JWK, secretJwk: JWK },
-        readerDids: Did[]
-    ): Promise<{ messageIdOnChain: string, storageIdentifier: string }> {
+        readerDids: Did[] | string[]
+    ): Promise<any> {
         console.log(`Sharing bucket key for bucket ${bucketId} with ${readerDids.length} readers.`);
 
         const skbForWasm = bucketKeys.secretJwk;
@@ -504,35 +504,41 @@ export class AssetDidCommClient {
         // 2. Resolve Reader DIDs to get their public keys for encryption
         const recipientKeys: JWK[] = [bucketKeys.publicJwk]; // Bucket can always decrypt its own key messages
         for (const did of readerDids) {
-            // In a real scenario, you'd resolve the DID and get the keyAgreement key
-            const resolutionResult = await this.config.didResolver(did);
+            console.log(`Resolving DID for reader: ${did}`);
+            const resolutionResult = await this.config.didResolver.resolve(did as Did); // Use the configured resolver
 
             const didDocument = resolutionResult.didDocument;
+            didDocument?.verificationMethod[0].publicKeyMultibase
 
-            if (!didDocument) continue;
+            if (!didDocument || !didDocument.keyAgreement || didDocument.keyAgreement.length === 0) {
+                console.warn(`Could not find a valid keyAgreement key for DID: ${did}. Skipping.`);
+                continue;
+            }
 
-            // This is a simplification; you'd need to find the correct key from the DID doc
-            const readerPk = didDocument.? keyAgreement[0].publicKeyJwk;
-            recipientKeys.push(readerPk);
+            // Find the first keyAgreement key that is a JWK.
+            // A real implementation might be more selective.
+            const keyAgreementEntry = didDocument.keyAgreement.find(
+                (key) => key.publicKeyJwk
+            );
+
+            if (!keyAgreementEntry || !keyAgreementEntry.publicKeyJwk) {
+                console.warn(`No suitable publicKeyJwk found in keyAgreement for DID: ${did}. Skipping.`);
+                continue;
+            }
+
+            console.log(`Found keyAgreement key for ${did}: ${keyAgreementEntry.id}`);
+            recipientKeys.push(keyAgreementEntry.publicKeyJwk as JWK);
         }
-        // For this example, we'll use a mock key for the reader 'Charlie'
-        recipientKeys.push({ kty: 'EC', crv: 'P-256', x: 'charlie_pub_x', y: 'charlie_pub_y' }); // Mock Charlie's Public Key
+
+        // Ensure we have recipients other than the bucket itself
+        if (recipientKeys.length <= 1) {
+            throw new Error("No valid reader DIDs could be resolved to public keys.");
+        }
 
         // 3. Encrypt for multiple recipients
         const jweObject = await encryptJWEForMultipleRecipients(plaintextBytes, recipientKeys);
-        const jweString = JSON.stringify(jweObject);
 
-        // 4. Upload to storage
-        const storageIdentifier = await this.config.storageAdapter.upload(jweString);
-        console.log(`Uploaded key-sharing message to: ${storageIdentifier}`);
-
-        // 5. Submit to pallet with a special tag
-        const messageIdOnChain = await this.submitToPallet(entityId, bucketId, { // No destructuring
-            reference: storageIdentifier,
-            tag: "didcomm/key-sharing-v1",
-        });
-
-        return { messageIdOnChain, storageIdentifier };
+        return
     }
 
     /**

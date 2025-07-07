@@ -1,3 +1,4 @@
+import { Did } from "@kiltprotocol/types";
 import { DidResolver, Signer, SignerPayloadRaw } from "../config";
 
 // Mock Signer (ensure it's correctly implementing the Signer interface)
@@ -26,7 +27,7 @@ export class MockSigner implements Signer {
 
 // Mock DID Resolver (ensure it's correctly implementing the DidResolver interface)
 export class MockDidResolver implements DidResolver {
-    async resolve(did: string): Promise<any> { // Consider using a specific DID Document type
+    async resolve(did: string): Promise<any> {
         console.log(`MockDidResolver: Resolving ${did}`);
         if (did === "did:example:test1" || did === "did:example:test2" || did === "did:mock:signer") {
             return {

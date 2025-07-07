@@ -32,11 +32,6 @@ export interface AssetDidCommClientConfig {
     // Potentially default KILT API endpoint if not covered by didResolver
 }
 
-export type DidResolver = (did: Did) => Promise<ResolutionResult>;
-
-export interface AssetDidCommClientConfig {
-    storageAdapter: StorageAdapter;
-    rpcEndpoint?: string;
-    didResolver: DidResolver;
-    signer: Signer;
+export interface DidResolver {
+    resolve(did: Did | string): Promise<ResolutionResult | any>
 }
