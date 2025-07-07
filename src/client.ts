@@ -59,14 +59,14 @@ export class AssetDidCommClient {
     }
 
     /**
- * A generic helper to submit an extrinsic and wait for a specific event.
- *
- * @param extrinsic The SubmittableExtrinsic to send.
- * @param eventFinder A function that takes an event and returns true if it's the one we're looking for.
- * @param eventValidator A function that validates the found event's data and returns true if it's the correct instance.
- * @returns A promise that resolves with the found event and the transaction hash.
- * @template T - The expected type of the data extracted from the event.
- */
+     * A generic helper to submit an extrinsic and wait for a specific event.
+     *
+     * @param extrinsic The SubmittableExtrinsic to send.
+     * @param eventFinder A function that takes an event and returns true if it's the one we're looking for.
+     * @param eventValidator A function that validates the found event's data and returns true if it's the correct instance.
+     * @returns A promise that resolves with the found event and the transaction hash.
+     * @template T - The expected type of the data extracted from the event.
+     */
     private _submitAndWatch<T>( // Removed async from the function signature
         extrinsic: SubmittableExtrinsic<'promise'>,
         eventFinder: (event: IEvent<any>) => boolean,
@@ -102,6 +102,7 @@ export class AssetDidCommClient {
                         }
 
                         if (result.status.isFinalized) {
+                            console.log(`Blockhash: ${result.status.asFinalized}`);
                             unsubscribe();
                             // If it finalizes without our event, something went wrong.
                             reject(new Error("Transaction finalized, but the expected event was not found or was invalid."));
@@ -604,17 +605,17 @@ export class AssetDidCommClient {
  * @param adminDid The DID of the account to be made an admin.
  * @returns The transaction hash.
  */
-    public async addAdmin(entityId: number, bucketId: number, adminDid: string): Promise<string> {
+    public async addAdmin(entityId: number, bucketId: number, adminAddress: string): Promise<string> {
         if (!this.polkadotApi) throw new Error("Polkadot API not initialized.");
 
-        const extrinsic = this.polkadotApi.tx.buckets.addAdmin(entityId, bucketId, adminDid);
+        const extrinsic = this.polkadotApi.tx.buckets.addAdmin(entityId, bucketId, adminAddress);
 
         const { txHash } = await this._submitAndWatch(
             extrinsic,
             (event) => this.polkadotApi!.events.buckets.AdminAdded.is(event),
             (eventRecord) => {
                 const [, eventBucketId, eventAdmin] = eventRecord.event.data;
-                if ((eventBucketId as any).toNumber() === bucketId && eventAdmin.toString() === adminDid) {
+                if ((eventBucketId as any).toNumber() === bucketId && eventAdmin.toString() === adminAddress) {
                     return { success: true }; // We just need confirmation
                 }
                 return null;
@@ -628,21 +629,20 @@ export class AssetDidCommClient {
      * Must be called by an Admin of the bucket.
      * @param entityId The ID of the parent entity.
      * @param bucketId The ID of the bucket.
-     * @param contributorDid The DID of the account to be made a contributor.
+     * @param contributorAddress The address of the account to be made a contributor.
      * @returns The transaction hash.
      */
-    public async addContributor(entityId: number, bucketId: number, contributorDid: string): Promise<string> {
+    public async addContributor(entityId: number, bucketId: number, contributorAddress: string): Promise<string> {
         if (!this.polkadotApi) throw new Error("Polkadot API not initialized.");
 
-        // Note: The pallet extrinsic is grantWriteAccess, but we listen for ContributorAdded event
-        const extrinsic = this.polkadotApi.tx.buckets.grantWriteAccess(entityId, bucketId, contributorDid);
+        const extrinsic = this.polkadotApi.tx.buckets.addContributor(entityId, bucketId, contributorAddress);
 
         const { txHash } = await this._submitAndWatch(
             extrinsic,
             (event) => this.polkadotApi!.events.buckets.ContributorAdded.is(event),
             (eventRecord) => {
                 const [, eventBucketId, eventContributor] = eventRecord.event.data;
-                if ((eventBucketId as any).toNumber() === bucketId && eventContributor.toString() === contributorDid) {
+                if ((eventBucketId as any).toNumber() === bucketId && eventContributor.toString() === contributorAddress) {
                     return { success: true };
                 }
                 return null;

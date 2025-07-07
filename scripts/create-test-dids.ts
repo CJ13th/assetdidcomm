@@ -14,7 +14,6 @@ import { Crypto } from '@kiltprotocol/utils'
 
 import { Multikey } from '@kiltprotocol/utils'
 
-
 import {
     DidHelpers,
     DidResolver,
@@ -24,10 +23,10 @@ import {
     connect,
 } from '@kiltprotocol/sdk-js';
 
+
 async function main() {
     const api = await connect('wss://peregrine.kilt.io');
     await init();
-
 
     console.log('✅ Successfully connected to the KILT blockchain.');
 
@@ -39,7 +38,7 @@ async function main() {
     // An authentication key is required to create the DID and control it later.
     const authenticationKey = generateKeypair();
     console.log(
-        `🔑 Generated Authentication Key (Multibase): ${authenticationKey.publicKeyMultibase}`
+        `🔑 Generated Authentication Key (Multibase Public): ${authenticationKey.publicKeyMultibase} (Multibase Secret): ${authenticationKey.secretKeyMultibase}`
     );
 
     // A key agreement (encryption) key is needed for encrypting and decrypting messages.
@@ -47,7 +46,10 @@ async function main() {
     console.log(
         `🔑 Generated Key Agreement Key (Public): ${Crypto.u8aToHex(
             keyAgreementKey.publicKey
-        )}`
+        )} (Secret): ${Crypto.u8aToHex(
+            keyAgreementKey.secretKey
+        )}
+        `
     );
 
     // 3. Create the DID on the blockchain.
