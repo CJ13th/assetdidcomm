@@ -1,4 +1,6 @@
 // src/client.ts
+import * as fs from 'fs';
+import type { Option } from '@polkadot/types';
 import { AssetDidCommClientConfig, Signer, StorageAdapter, DidResolver } from './config'; // Assuming config.ts exists
 import { ApiPromise, WsProvider } from '@polkadot/api'; // Add to imports
 import type { SubmittableExtrinsic } from '@polkadot/api/types';
@@ -13,6 +15,14 @@ import { MOCK_PKB_JWK, MOCK_SKB_JWK } from './crypto/keys'; // Using the mock PK
 import type { JWK } from 'jose';
 import { v4 as uuidv4 } from 'uuid';
 import { KeyringSigner } from './signers/keyring';
+
+
+interface OnChainMetadata {
+    // The SHA-256 digest of the JWE message, hex-encoded
+    digest: string;
+    // Optional: any other metadata to include
+    contentType?: string;
+}
 
 
 export class AssetDidCommClient {
@@ -180,25 +190,26 @@ export class AssetDidCommClient {
     }
 
     /**
-     * Sets or rotates the public key (PKB) for a bucket, making it writable.
+     * Sets or rotates the public key ID (PKB's ID) for a bucket, making it writable.
      * Must be called by an Admin of the bucket.
      * @param entityId The ID of the parent entity.
      * @param bucketId The ID of the bucket.
-     * @param publicKeyJwk The new public key in JWK format.
+     * @param keyId The numeric ID (`u128`) of the new public key. The full key must be discoverable off-chain.
      * @returns The transaction hash.
      */
-    public async setBucketPublicKey(entityId: number, bucketId: number, publicKeyJwk: JWK): Promise<string> {
+    public async setBucketPublicKey(entityId: number, bucketId: number, keyId: number): Promise<string> {
         if (!this.polkadotApi) throw new Error("Polkadot API not initialized.");
 
-        const keyId = publicKeyJwk.kid || JSON.stringify(publicKeyJwk);
+        // The pallet's `resumeWriting` extrinsic expects the numeric keyId directly.
         const extrinsic = this.polkadotApi.tx.buckets.resumeWriting(entityId, bucketId, keyId);
 
         const { txHash } = await this._submitAndWatch(
             extrinsic,
             (event) => this.polkadotApi!.events.buckets.BucketWritableWithKey.is(event),
             (eventRecord) => {
-                const [, eventBucketId, eventKey] = eventRecord.event.data;
-                if ((eventBucketId as any).toNumber() === bucketId && eventKey.toString() === keyId) {
+                const [, eventBucketId, eventKeyId] = eventRecord.event.data;
+                // Verify that the on-chain event matches the keyId we sent.
+                if ((eventBucketId as any).toNumber() === bucketId && (eventKeyId as any).toNumber() === keyId) {
                     return { success: true };
                 }
                 return null;
@@ -229,7 +240,6 @@ export class AssetDidCommClient {
         console.log(`Attempting to send direct message to ${recipientDid} for entity ${entityId}, bucket ${bucketId}`);
 
         // 1. Fetch the Public Key of the Bucket (PKB)
-        // For now, this is mocked. Later, it will query the Substrate pallet.
         const pkbJwk = await this.fetchBucketPublicKey(entityId, bucketId);
         if (!pkbJwk) {
             throw new Error(`Could not fetch PKB for bucket ${bucketId} under entity ${entityId}.`);
@@ -237,18 +247,17 @@ export class AssetDidCommClient {
 
         // 2. Construct Plaintext DIDComm Message (using WASM module)
         const senderDid = this.config.signer.getAddress();
-        const messageId = uuidv4(); // Generate a unique ID for the DIDComm message
+        const messageId = uuidv4();
         const createdTime = Math.floor(Date.now() / 1000);
 
         let didCommMsgString: string;
         try {
-            didCommMsgString = createDirectMessage({ // This function is from your WASM binding
+            didCommMsgString = createDirectMessage({
                 id: messageId,
                 to: [recipientDid],
                 from: senderDid,
-                createdTime: createdTime, // Ensure your WASM options match this field name if used
+                createdTime: createdTime,
                 message: messageContent,
-                // lang: "en", // Optional, add if your WASM builder supports it
             });
         } catch (e) {
             console.error("Error creating DIDComm message via WASM:", e);
@@ -270,8 +279,6 @@ export class AssetDidCommClient {
         console.log("Encrypted JWE:", jweString);
 
         // 4. Upload Encrypted JWE to Storage
-        // The storage adapter should handle Uint8Array or string appropriately.
-        // Storing the JWE string directly is fine.
         const encryptedPayloadForStorage = new TextEncoder().encode(jweString);
         let storageIdentifier: string;
         try {
@@ -282,24 +289,30 @@ export class AssetDidCommClient {
         }
         console.log(`Encrypted message stored at: ${storageIdentifier}`);
 
-        // 5. Calculate Digest of the JWE for on-chain integrity check
+        // 5. Calculate Digest and construct the new metadata object
         const digestHex = await calculateSha256Digest(jweString);
-        console.log(`Digest of JWE (for pallet): ${digestHex}`);
+        console.log(`Digest of JWE (to be stored in metadata): ${digestHex}`);
 
-        // 6. Submit Message Reference and Metadata to Substrate Pallet (Mocked for now)
+        // NEW: The digest is now part of this structured metadata object.
+        const metadataObject: OnChainMetadata = {
+            digest: digestHex,
+            contentType: 'application/didcomm+json'
+        };
+
+        // 6. Submit Message Reference and the new metadata to Substrate Pallet
         const palletMessageData = {
-            reference: storageIdentifier, // This is the CID or URL from storage
-            digest: digestHex,            // Hash of the JWE content
+            reference: storageIdentifier,
             tag: tag,
-            // contributor: senderDid, // Pallet might get this from tx origin
+            // CHANGED: We now pass the entire metadata object.
+            metadata: metadataObject,
         };
 
         let messageIdOnChain: string;
         try {
+            // The call to submitToPallet is now updated with the new payload structure
             messageIdOnChain = await this.submitToPallet(entityId, bucketId, palletMessageData);
         } catch (e) {
             console.error("Error submitting to pallet:", e);
-            // Potentially try to remove from storage if pallet submission fails? Complex.
             throw new Error("Failed to submit message metadata to the blockchain.");
         }
         console.log(`Message metadata submitted to pallet. On-chain ID/TxHash: ${messageIdOnChain}`);
@@ -308,58 +321,83 @@ export class AssetDidCommClient {
     }
 
     /**
-     * Fetches the Public Key of the Bucket (PKB).
-     * @param entityId The ID of the entity.
-     * @param bucketId The ID of the bucket.
-     * @returns The PKB in JWK format, or null if not found/not writable.
-     */
+    * Fetches the Public Key of the Bucket (PKB) by first getting its ID from the pallet,
+    * then resolving the full key from an off-chain source.
+    *
+    * @param entityId The ID of the entity.
+    * @param bucketId The ID of the bucket.
+    * @returns The PKB in JWK format, or null if not found/not writable.
+    */
     private async fetchBucketPublicKey(entityId: number, bucketId: number): Promise<JWK | null> {
-        console.warn(`Fetching PKB for entity ${entityId}, bucket ${bucketId} - MOCK IMPLEMENTATION`);
-        // TODO: Implement actual pallet query
-        // Example (pseudo-code for pallet query):
-        // if (!this.polkadotApi) {
-        //   console.error("Polkadot API not initialized. Cannot fetch PKB.");
-        //   return null;
-        // }
-        // try {
-        //   const bucketInfoRaw = await this.polkadotApi.query.bucket.buckets(entityId, bucketId);
-        //   if (bucketInfoRaw.isNone) return null;
-        //   const bucketInfo = bucketInfoRaw.unwrap();
-        //   if (bucketInfo.status.isWritable) {
-        //     const pkbString = bucketInfo.status.asWritable.toString(); // Or .toUtf8(), .toHex()
-        //     return JSON.parse(pkbString) as JWK; // Assuming pallet stores it as a stringified JWK
-        //   }
-        //   return null;
-        // } catch (error) {
-        //   console.error(`Error fetching PKB from pallet for ${entityId}/${bucketId}:`, error);
-        //   return null;
-        // }
-        return MOCK_PKB_JWK; // Return our hardcoded mock key for now
+        console.log(`Fetching PKB for entity ${entityId}, bucket ${bucketId}...`);
+        if (!this.polkadotApi) {
+            console.error("Polkadot API not initialized. Cannot fetch PKB.");
+            return null;
+        }
+
+        // 1. Query the pallet to get the bucket's status and key ID.
+        const bucketInfoRaw = await this.polkadotApi.query.buckets.buckets(entityId, bucketId) as unknown as Option<any>;
+        if (bucketInfoRaw.isNone) {
+            console.error(`Bucket ${bucketId} not found in namespace ${entityId}.`);
+            return null;
+        }
+
+        const bucketInfo = bucketInfoRaw.unwrap();
+        if (bucketInfo.status.isWritable) {
+            const keyId = bucketInfo.status.asWritable.toNumber();
+            console.log(`Bucket is writable with keyId: ${keyId}. Now resolving off-chain...`);
+
+            // 2. Resolve the keyId to a full JWK using our file-based discovery for the E2E test.
+            // In a real system, this would be a call to a DID resolver or a dedicated key discovery service.
+            try {
+                // This assumes the test scripts are run from the project root.
+                // A more robust solution might use relative paths or environment variables.
+                const keyStateContent = fs.readFileSync('./examples/e2e-flow/e2e-keys.json', 'utf-8');
+                const keyState = JSON.parse(keyStateContent);
+                const publicKeyJwk = keyState[keyId];
+
+                if (!publicKeyJwk) {
+                    throw new Error(`Key ID ${keyId} not found in e2e-keys.json.`);
+                }
+                console.log(`✅ Successfully resolved keyId ${keyId} to a JWK.`);
+                return publicKeyJwk as JWK;
+
+            } catch (error) {
+                console.error(`Error resolving keyId ${keyId} from off-chain store:`, error);
+                return null;
+            }
+
+        } else {
+            console.warn(`Bucket ${bucketId} is locked. No public key available.`);
+            return null;
+        }
     }
+
 
     private async submitToPallet(
         entityId: number,
         bucketId: number,
-        messageData: { reference: string; tag: string; metadata?: object }
+        // CHANGED: The signature now expects our structured OnChainMetadata object.
+        messageData: { reference: string; tag: string; metadata: OnChainMetadata }
     ): Promise<string> {
         if (!this.polkadotApi) throw new Error("Polkadot API not initialized.");
 
+        // This object must precisely match the pallet's `MessageInput` struct.
         const messageInput = {
             reference: messageData.reference,
-            tag: messageData.tag,
-            metadata: messageData.metadata || {}
+            // The pallet expects an Option<Tag>, so we pass the tag or null.
+            tag: messageData.tag || null,
+            // The API will encode this string into a Vec<u8> for the pallet.
+            metadata_input: JSON.stringify(messageData.metadata)
         };
 
         const extrinsic = this.polkadotApi.tx.buckets.write(entityId, bucketId, messageInput);
 
-        // In a `write` operation, we might just care that it's finalized, 
-        // but watching for the event is more robust.
+        // This part remains unchanged as it correctly handles submission and event watching.
         const { txHash } = await this._submitAndWatch(
             extrinsic,
             (event) => this.polkadotApi!.events.buckets.NewMessage.is(event),
             (eventRecord) => {
-                // We could validate the message ID if we knew it beforehand,
-                // but for now, just confirming the event for the correct bucket is enough.
                 const [eventBucketId] = eventRecord.event.data;
                 if ((eventBucketId as any).toNumber() === bucketId) {
                     return { success: true };
@@ -488,8 +526,6 @@ export class AssetDidCommClient {
         };
 
         // 1. Create the DIDComm Key-Sharing Message (using WASM module)
-        // The spec has latestKey/previousKeys, but the module has `keys`. We adapt.
-        // The key being shared is the *secret key* of the bucket.
         const keySharingMsgString = createKeySharingMessage({
             id: uuidv4(),
             from: this.config.signer.getAddress(),
@@ -515,11 +551,8 @@ export class AssetDidCommClient {
                 console.warn(`Could not find a valid keyAgreement key for DID: ${did}. Skipping.`);
                 continue;
             }
-
-            // Find the first keyAgreement key that is a JWK.
-            // A real implementation might be more selective.
             const keyAgreementEntry = didDocument.keyAgreement.find(
-                (key) => key.publicKeyJwk
+                (key: any) => key.publicKeyJwk
             );
 
             if (!keyAgreementEntry || !keyAgreementEntry.publicKeyJwk) {
@@ -539,7 +572,9 @@ export class AssetDidCommClient {
         // 3. Encrypt for multiple recipients
         const jweObject = await encryptJWEForMultipleRecipients(plaintextBytes, recipientKeys);
 
-        return
+        // TODO: Complete this function by uploading JWE and submitting to pallet
+        console.warn("shareBucketKey is incomplete: JWE is created but not uploaded or submitted to the chain.");
+        return { jweObject }
     }
 
     /**
@@ -555,26 +590,21 @@ export class AssetDidCommClient {
         console.log(`Attempting to retrieve SKB for bucket ${bucketId} as a reader.`);
 
         // 1. Query the pallet for key-sharing messages in the bucket.
-        // This is a simplified query. A real implementation would need more robust filtering.
         const messageEntries = await this.polkadotApi.query.buckets.messages.entries(bucketId);
         const keySharingMessages = messageEntries
             .filter(([, value]) => (value as any).isSome) // Ensure the Option has a value
             .map(([key, value]) => {
                 const unwrappedValue = (value as any).unwrap(); // Cast to 'any' to access unwrap()
                 const messageData = unwrappedValue.toPrimitive(); // Use toPrimitive() for a plain JS object
-
-                // The message ID is the second argument in the double map storage key
-                const messageId = (key.args[1] as any).toNumber(); // Cast to 'any' to access toNumber()
-
+                const messageId = (key.args[1] as any).toNumber(); // The message ID is the second key in the double map
                 return { ...messageData, id: messageId };
             })
-            .filter(msg => msg.tag === "didcomm/key-sharing-v1");
+            .filter(msg => msg.tag === "didcomm/key-sharing-v1"); // Use a specific tag for key sharing
 
         if (keySharingMessages.length === 0) {
             throw new Error(`No key-sharing message found in bucket ${bucketId}.`);
         }
 
-        // For simplicity, we take the latest one.
         const keyMessageInfo = keySharingMessages.sort((a, b) => b.id - a.id)[0];
         console.log(`Found key-sharing message at CID: ${keyMessageInfo.reference}`);
 
@@ -597,14 +627,16 @@ export class AssetDidCommClient {
         return skb;
     }
 
+    // --- Roles and Permissions Management ---
+
     /**
- * Sets an Admin for a specific bucket.
- * Must be called by a Manager of the parent entity.
- * @param entityId The ID of the parent entity.
- * @param bucketId The ID of the bucket.
- * @param adminDid The DID of the account to be made an admin.
- * @returns The transaction hash.
- */
+     * Adds an Admin to a specific bucket.
+     * Must be called by a Manager of the parent entity.
+     * @param entityId The ID of the parent entity (namespace).
+     * @param bucketId The ID of the bucket.
+     * @param adminAddress The address of the account to be made an admin.
+     * @returns The transaction hash.
+     */
     public async addAdmin(entityId: number, bucketId: number, adminAddress: string): Promise<string> {
         if (!this.polkadotApi) throw new Error("Polkadot API not initialized.");
 
@@ -616,13 +648,91 @@ export class AssetDidCommClient {
             (eventRecord) => {
                 const [, eventBucketId, eventAdmin] = eventRecord.event.data;
                 if ((eventBucketId as any).toNumber() === bucketId && eventAdmin.toString() === adminAddress) {
-                    return { success: true }; // We just need confirmation
+                    return { success: true };
                 }
                 return null;
             }
         );
         return txHash;
     }
+
+    /**
+     * Removes an Admin from a specific bucket.
+     * Must be called by a Manager of the parent entity.
+     * @param entityId The ID of the parent entity (namespace).
+     * @param bucketId The ID of the bucket.
+     * @param adminAddress The address of the admin to be removed.
+     * @returns The transaction hash.
+     */
+    public async removeAdmin(entityId: number, bucketId: number, adminAddress: string): Promise<string> {
+        if (!this.polkadotApi) throw new Error("Polkadot API not initialized.");
+
+        const extrinsic = this.polkadotApi.tx.buckets.removeAdmin(entityId, bucketId, adminAddress);
+        const { txHash } = await this._submitAndWatch(
+            extrinsic,
+            (event) => this.polkadotApi!.events.buckets.AdminRemoved.is(event),
+            (eventRecord) => {
+                const [, eventBucketId, eventAdmin] = eventRecord.event.data;
+                if ((eventBucketId as any).toNumber() === bucketId && eventAdmin.toString() === adminAddress) {
+                    return { success: true };
+                }
+                return null;
+            }
+        );
+        return txHash;
+    }
+
+
+    /**
+     * Adds a Manager to a specific entity (namespace).
+     * Must be called by an existing Manager of the entity.
+     * @param entityId The ID of the entity (namespace).
+     * @param managerAddress The address of the account to be made a manager.
+     * @returns The transaction hash.
+     */
+    public async addManager(entityId: number, managerAddress: string): Promise<string> {
+        if (!this.polkadotApi) throw new Error("Polkadot API not initialized.");
+
+        const extrinsic = this.polkadotApi.tx.buckets.addManager(entityId, managerAddress);
+        const { txHash } = await this._submitAndWatch(
+            extrinsic,
+            (event) => this.polkadotApi!.events.buckets.ManagerAdded.is(event),
+            (eventRecord) => {
+                const [eventNamespaceId, eventManager] = eventRecord.event.data;
+                if ((eventNamespaceId as any).toNumber() === entityId && eventManager.toString() === managerAddress) {
+                    return { success: true };
+                }
+                return null;
+            }
+        );
+        return txHash;
+    }
+
+    /**
+     * Removes a Manager from a specific entity (namespace).
+     * Must be called by an existing Manager of the entity.
+     * @param entityId The ID of the entity (namespace).
+     * @param managerAddress The address of the manager to be removed.
+     * @returns The transaction hash.
+     */
+    public async removeManager(entityId: number, managerAddress: string): Promise<string> {
+        if (!this.polkadotApi) throw new Error("Polkadot API not initialized.");
+
+        const extrinsic = this.polkadotApi.tx.buckets.removeManager(entityId, managerAddress);
+        const { txHash } = await this._submitAndWatch(
+            extrinsic,
+            (event) => this.polkadotApi!.events.buckets.ManagerRemoved.is(event),
+            (eventRecord) => {
+                const [eventNamespaceId, eventManager] = eventRecord.event.data;
+                if ((eventNamespaceId as any).toNumber() === entityId && eventManager.toString() === managerAddress) {
+                    return { success: true };
+                }
+                return null;
+            }
+        );
+        return txHash;
+    }
+
 
     /**
      * Adds a Contributor to a specific bucket.
@@ -643,6 +753,162 @@ export class AssetDidCommClient {
             (eventRecord) => {
                 const [, eventBucketId, eventContributor] = eventRecord.event.data;
                 if ((eventBucketId as any).toNumber() === bucketId && eventContributor.toString() === contributorAddress) {
+                    return { success: true };
+                }
+                return null;
+            }
+        );
+        return txHash;
+    }
+
+    /**
+     * Removes write access for a Contributor from a specific bucket.
+     * Must be called by an Admin of the bucket.
+     * @param entityId The ID of the parent entity.
+     * @param bucketId The ID of the bucket.
+     * @param contributorAddress The address of the contributor to remove.
+     * @returns The transaction hash.
+     */
+    public async removeContributor(entityId: number, bucketId: number, contributorAddress: string): Promise<string> {
+        if (!this.polkadotApi) throw new Error("Polkadot API not initialized.");
+
+        const extrinsic = this.polkadotApi.tx.buckets.removeContributor(entityId, bucketId, contributorAddress);
+        const { txHash } = await this._submitAndWatch(
+            extrinsic,
+            (event) => this.polkadotApi!.events.buckets.ContributorRemoved.is(event),
+            (eventRecord) => {
+                const [, eventBucketId, eventContributor] = eventRecord.event.data;
+                if ((eventBucketId as any).toNumber() === bucketId && eventContributor.toString() === contributorAddress) {
+                    return { success: true };
+                }
+                return null;
+            }
+        );
+        return txHash;
+    }
+
+
+    // --- Bucket and Tag Management ---
+
+    /**
+     * Pauses write operations on a bucket.
+     * Must be called by an Admin of the bucket.
+     * @param entityId The ID of the parent entity (namespace).
+     * @param bucketId The ID of the bucket to pause.
+     * @returns The transaction hash.
+     */
+    public async pauseBucketWrites(entityId: number, bucketId: number): Promise<string> {
+        if (!this.polkadotApi) throw new Error("Polkadot API not initialized.");
+
+        const extrinsic = this.polkadotApi.tx.buckets.pauseWriting(entityId, bucketId);
+        const { txHash } = await this._submitAndWatch(
+            extrinsic,
+            (event) => this.polkadotApi!.events.buckets.PausedBucket.is(event),
+            (eventRecord) => {
+                const [, eventBucketId] = eventRecord.event.data;
+                if ((eventBucketId as any).toNumber() === bucketId) {
+                    return { success: true };
+                }
+                return null;
+            }
+        );
+        return txHash;
+    }
+
+    /**
+     * Creates a new tag that can be used for messages within a bucket.
+     * Must be called by an Admin of the bucket.
+     * @param bucketId The ID of the bucket to add the tag to.
+     * @param tag The string tag to create.
+     * @returns The transaction hash.
+     */
+    public async createTag(bucketId: number, tag: string): Promise<string> {
+        if (!this.polkadotApi) throw new Error("Polkadot API not initialized.");
+
+        const extrinsic = this.polkadotApi.tx.buckets.createTag(bucketId, tag);
+        const { txHash } = await this._submitAndWatch(
+            extrinsic,
+            (event) => this.polkadotApi!.events.buckets.NewTag.is(event),
+            (eventRecord) => {
+                const [eventBucketId, eventTag] = eventRecord.event.data;
+                if ((eventBucketId as any).toNumber() === bucketId && eventTag.toString() === tag) {
+                    return { success: true };
+                }
+                return null;
+            }
+        );
+        return txHash;
+    }
+
+
+    // --- Governance Functions ---
+
+    /**
+     * Removes an entire entity (namespace) and all of its associated buckets and messages.
+     * Must be called by a governance origin.
+     * @param entityId The ID of the entity (namespace) to remove.
+     * @returns The transaction hash.
+     */
+    public async removeNamespace(entityId: number): Promise<string> {
+        if (!this.polkadotApi) throw new Error("Polkadot API not initialized.");
+
+        const extrinsic = this.polkadotApi.tx.buckets.removeNamespace(entityId);
+        const { txHash } = await this._submitAndWatch(
+            extrinsic,
+            (event) => this.polkadotApi!.events.buckets.NamespaceDeleted.is(event),
+            (eventRecord) => {
+                const [eventNamespaceId] = eventRecord.event.data;
+                if ((eventNamespaceId as any).toNumber() === entityId) {
+                    return { success: true };
+                }
+                return null;
+            }
+        );
+        return txHash;
+    }
+
+    /**
+     * Removes a specific bucket and its messages from an entity.
+     * Must be called by a governance origin.
+     * @param entityId The ID of the parent entity.
+     * @param bucketId The ID of the bucket to remove.
+     * @returns The transaction hash.
+     */
+    public async removeBucket(entityId: number, bucketId: number): Promise<string> {
+        if (!this.polkadotApi) throw new Error("Polkadot API not initialized.");
+
+        const extrinsic = this.polkadotApi.tx.buckets.removeBucket(entityId, bucketId);
+        const { txHash } = await this._submitAndWatch(
+            extrinsic,
+            (event) => this.polkadotApi!.events.buckets.BucketDeleted.is(event),
+            (eventRecord) => {
+                const [eventNamespaceId, eventBucketId] = eventRecord.event.data;
+                if ((eventNamespaceId as any).toNumber() === entityId && (eventBucketId as any).toNumber() === bucketId) {
+                    return { success: true };
+                }
+                return null;
+            }
+        );
+        return txHash;
+    }
+
+    /**
+     * Removes a specific message from a bucket.
+     * Must be called by a governance origin.
+     * @param bucketId The ID of the bucket containing the message.
+     * @param messageId The ID of the message to remove.
+     * @returns The transaction hash.
+     */
+    public async removeMessage(bucketId: number, messageId: number): Promise<string> {
+        if (!this.polkadotApi) throw new Error("Polkadot API not initialized.");
+
+        const extrinsic = this.polkadotApi.tx.buckets.removeMessage(bucketId, messageId);
+        const { txHash } = await this._submitAndWatch(
+            extrinsic,
+            (event) => this.polkadotApi!.events.buckets.MessageDeleted.is(event),
+            (eventRecord) => {
+                const [eventBucketId, eventMessageId] = eventRecord.event.data;
+                if ((eventBucketId as any).toNumber() === bucketId && (eventMessageId as any).toNumber() === messageId) {
                     return { success: true };
                 }
                 return null;
