@@ -3,8 +3,9 @@ import * as jose from 'jose';
 import type { JWK } from 'jose';
 
 // Define the JWE algorithms you'll use (as per DIDCOMM VAULT spec or your choice)
-const JWE_ALG = 'ECDH-ES+A256KW'; // Key Encryption Algorithm
-const JWE_ENC = 'A256GCM';       // Content Encryption Algorithm
+const JWE_ALG = 'ECDH-ES+A256KW';
+const JWE_ENC = 'A256GCM';
+
 
 /**
  * Encrypts a plaintext payload (DIDComm message) using JWE.
@@ -142,7 +143,7 @@ export async function decryptGeneralJWE(
     privateKeyJwk: JWK
 ): Promise<Uint8Array> {
     try {
-        const privateKey = await jose.importJWK(privateKeyJwk, JWE_ALG);
+        const privateKey = await jose.importJWK(privateKeyJwk, "ECDH-ES");
         const { plaintext } = await jose.generalDecrypt(jwe, privateKey);
         return plaintext;
     } catch (error) {

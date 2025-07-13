@@ -22,6 +22,11 @@ import {
     init,
     connect,
 } from '@kiltprotocol/sdk-js';
+import { JWK } from 'jose';
+
+function u8aToBase64Url(data: Uint8Array): string {
+    return Buffer.from(data).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+}
 
 
 async function main() {
@@ -52,6 +57,21 @@ async function main() {
         `
     );
 
+    console.log("\n--- Converting to JSON Web Key (JWK) ---");
+    const publicKeyBase64Url = u8aToBase64Url(keyAgreementKey.publicKey);
+    const secretKeyBase64Url = u8aToBase64Url(keyAgreementKey.secretKey);
+
+    const privateKeyJwk: JWK = {
+        kty: 'OKP',          // Key Type for Edwards-curve keys is "Octet Key Pair"
+        crv: 'X25519',       // The curve name matches the key type
+        x: publicKeyBase64Url,  // The 'x' parameter is the Base64URL encoded public key
+        d: secretKeyBase64Url,   // The 'd' parameter is the Base64URL encoded private key
+    };
+
+    console.log("\n✅ Conversion Successful!");
+    console.log("Generated Private Key JWK (copy this entire object):");
+    console.log(JSON.stringify(privateKeyJwk, null, 2));
+
     // 3. Create the DID on the blockchain.
     // This first transaction only includes the authentication key.
     console.log('\n🚀 Creating DID on chain...');
@@ -69,6 +89,8 @@ async function main() {
     }
     let didDocument = createDidResult.asConfirmed.didDocument;
     console.log(`✅ DID ${didDocument.id} created successfully.`);
+
+
 
     // 4. Add the key agreement key to the DID.
     // This is a second transaction that updates the DID document on-chain.

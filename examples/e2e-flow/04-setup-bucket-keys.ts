@@ -1,5 +1,5 @@
 import * as jose from 'jose';
-import { setup, readState, writeState, writeKeyState, CONTRIBUTOR_DID } from './_setup';
+import { setup, readState, writeState, writeKeyState, CONTRIBUTOR_DID_URI } from './_setup';
 
 async function main() {
     const { adminClient, disconnectAll } = await setup();
@@ -12,7 +12,7 @@ async function main() {
     try {
         // --- Step 5: Generate Bucket Keys (off-chain) ---
         console.log(`\n--- [ADMIN] 4a. Generating Bucket Keys ---`);
-        const { publicKey, privateKey } = await jose.generateKeyPair('ECDH-ES+A256KW', { extractable: true });
+        const { publicKey, privateKey } = await jose.generateKeyPair('ECDH-ES+A256KW', { crv: 'X25519', extractable: true });
         const bucketPkJwk = await jose.exportJWK(publicKey);
         const bucketSkJwk = await jose.exportJWK(privateKey);
 
@@ -34,8 +34,15 @@ async function main() {
         const setKeyTxHash = await adminClient.setBucketPublicKey(state.namespaceId, state.bucketId, numericKeyId);
         console.log(`✅ Bucket public key ID set successfully. Transaction Hash: ${setKeyTxHash}`);
 
+        // Create the tag required for the key-sharing message ---
+        const keySharingTag = 'didcomm/key-sharing-v1';
+        console.log(`\n--- [ADMIN] 4c. Creating Tag "${keySharingTag}" for Bucket ${state.bucketId} ---`);
+        // Note: The createTag extrinsic in your spec did not take a namespaceId, just the bucketId.
+        const tagTxHash = await adminClient.createTag(state.bucketId, keySharingTag);
+        console.log(`✅ Tag created successfully. Transaction Hash: ${tagTxHash}`);
+
         // --- Step 7: Share Secret Key with Contributor/Reader ---
-        console.log(`\n--- [ADMIN] 4c. Sharing Secret Key with Reader (${CONTRIBUTOR_DID}) ---`);
+        console.log(`\n--- [ADMIN] 4c. Sharing Secret Key with Reader (did:kilt:4p8Azs17Bod3LMHHoVWK3KHzbmKicnPpF28b96c6HYApfFu8) ---`);
 
         // Store the key in our off-chain key file BEFORE trying to share it,
         // so the `shareBucketKey` function can resolve it via `fetchBucketPublicKey`.
@@ -45,7 +52,7 @@ async function main() {
             state.namespaceId,
             state.bucketId,
             { publicJwk: bucketPkJwk, secretJwk: bucketSkJwk },
-            [CONTRIBUTOR_DID]
+            [CONTRIBUTOR_DID_URI]
         );
         console.log(`✅ Bucket secret key shared successfully.`);
 

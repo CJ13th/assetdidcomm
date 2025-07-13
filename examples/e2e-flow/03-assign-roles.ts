@@ -20,6 +20,11 @@ async function main() {
         const contributorTxHash = await adminClient.addContributor(state.namespaceId, state.bucketId, CONTRIBUTOR_DID);
         console.log(`✅ Contributor assigned successfully. Transaction Hash: ${contributorTxHash}`);
 
+        // --- Step 5: Assign Contributor by Admin ---
+        console.log(`\n--- [ADMIN] 3c.  Admin grants self Contributor role - Assigning Contributor (${ADMIN_DID}) to Bucket ${state.bucketId} ---`);
+        const adminAsContributorTxHash = await adminClient.addContributor(state.namespaceId, state.bucketId, ADMIN_DID);
+        console.log(`✅ Admin assigned as Contributor successfully. Transaction Hash: ${adminAsContributorTxHash}`);
+
     } catch (error) {
         console.error("\n❌ Error in Step 3: Assign Roles", error);
         process.exit(1);

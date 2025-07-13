@@ -1,17 +1,16 @@
 {
-  "405217265785": {
-    "kty": "EC",
-    "x": "a82ml3FOGk2w9PqyxguYL_SpUjlLDrdRx5DNpbHZzIg",
-    "y": "uk39mRZj8DTsZZPY8FrhG7vASHKn9XMXH6Ilt0jLuEA",
-    "crv": "P-256",
-    "kid": "numeric-id-405217265785"
-  },
-  "364610199746": {
-    "kty": "EC",
-    "x": "E9eWjx5CiE0eSi0AKt6NCu-uSMc0V3Jc-owPa0RZIFo",
-    "y": "hN6NL6XneXaBefD4MVJv3j15TPRsOMNmW36FEVisyPs",
-    "crv": "P-256",
+  "760335618704": {
+    "crv": "X25519",
+    "x": "u4ZgXtApOKgY3s851aYh5IVi92mHPUl63F83AP9VTRc",
+    "kty": "OKP",
     "use": "enc",
-    "kid": "numeric-id-364610199746"
+    "kid": "numeric-id-760335618704"
+  },
+  "472802872500": {
+    "crv": "X25519",
+    "x": "Ae76Z5JfXGP6ug6-cH58HDKaGBZzRIIZWLNe6zGyUTQ",
+    "kty": "OKP",
+    "use": "enc",
+    "kid": "numeric-id-472802872500"
   }
 }

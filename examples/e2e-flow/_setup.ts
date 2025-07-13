@@ -11,6 +11,7 @@ import { cryptoWaitReady } from '@polkadot/util-crypto';
 export const RPC_ENDPOINT = 'wss://fraa-flashbox-4654-rpc.a.stagenet.tanssi.network';
 export const KILT_ENDPOINT = 'wss://peregrine.kilt.io/';
 const PINATA_JWT = process.env.PINATA_JWT;
+const PINATA_GATEWAY = process.env.PINATA_GATEWAY;
 
 // --- Well-known Accounts & DIDs ---
 export const MANAGER_SEED = '//Alice';
@@ -21,7 +22,9 @@ export const CONTRIBUTOR_SEED = '//Charlie';
 // In a real scenario, you would fetch these from a user's profile or identity service.
 export const MANAGER_DID = '5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY'; // Example DID for Alice
 export const ADMIN_DID = '5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty';     // Example DID for Bob
-export const CONTRIBUTOR_DID = '5FLSigC9HGRKVhB9FiEo4Y3koPsNmBmLJbpXg2mp1hXcS59Y'; // Example DID for Charlie
+// export const CONTRIBUTOR_DID = '5FLSigC9HGRKVhB9FiEo4Y3koPsNmBmLJbpXg2mp1hXcS59Y'; // Example DID for Charlie
+export const CONTRIBUTOR_DID = '5DGp2qAiiy7wxau9Rd2QYvMhBhttqWutznM7bqBJ8xYmnSkt'; // Example DID for Charlie
+export const CONTRIBUTOR_DID_URI = 'did:kilt:4p8Azs17Bod3LMHHoVWK3KHzbmKicnPpF28b96c6HYApfFu8';
 
 // --- State Management ---
 const STATE_FILE_PATH = path.join(__dirname, 'e2e-state.json');
@@ -78,21 +81,21 @@ export async function setup() {
 
     // Create a client instance for each role
     const managerClient = new AssetDidCommClient({
-        storageAdapter: new PinataStorageAdapter({ jwt: PINATA_JWT }),
+        storageAdapter: new PinataStorageAdapter({ jwt: PINATA_JWT, publicGateway: `https://${PINATA_GATEWAY}/ipfs` }),
         didResolver: kiltResolver,
         signer: managerSigner,
         rpcEndpoint: RPC_ENDPOINT
     });
 
     const adminClient = new AssetDidCommClient({
-        storageAdapter: new PinataStorageAdapter({ jwt: PINATA_JWT }),
+        storageAdapter: new PinataStorageAdapter({ jwt: PINATA_JWT, publicGateway: `https://${PINATA_GATEWAY}/ipfs` }),
         didResolver: kiltResolver,
         signer: adminSigner,
         rpcEndpoint: RPC_ENDPOINT
     });
 
     const contributorClient = new AssetDidCommClient({
-        storageAdapter: new PinataStorageAdapter({ jwt: PINATA_JWT }),
+        storageAdapter: new PinataStorageAdapter({ jwt: PINATA_JWT, publicGateway: `https://${PINATA_GATEWAY}/ipfs` }),
         didResolver: kiltResolver,
         signer: contributorSigner,
         rpcEndpoint: RPC_ENDPOINT

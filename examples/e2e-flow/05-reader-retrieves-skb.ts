@@ -7,11 +7,10 @@ import type { JWK } from 'jose';
 // never exposed directly in code. We define it here ONLY for this E2E test to prove decryption.
 // You must generate this key when you create the DID for the Contributor/Charlie account.
 const CONTRIBUTOR_PRIVATE_KEY_JWK: JWK = {
-    // Replace with the actual private key from Charlie's DID
-    kty: 'OKP',
-    crv: 'X25519',
-    x: 'z-29A8fWj_V_p-sS5yZ2Y-pX6wA6bJ3wY5mZ6cZ9vJc',
-    d: 'aB7g-q3gZ5sW7nJ5kZ4hY6bX6pW9fL3vR8wY7pZ9wJc'
+    "kty": "OKP",
+    "crv": "X25519",
+    "x": "ao_-O0e_e2MhOwCiq2KVKzYbLETxQ__zd98UFkwgP0k",
+    "d": "DylBSNITA4q0kE3G_gPToCZ9N9kXRVMNbnQlxCdpNkM"
 };
 
 

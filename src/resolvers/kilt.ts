@@ -1,6 +1,10 @@
 // src/resolvers/kilt.ts
-
-import * as Kilt from '@kiltprotocol/sdk-js';
+import {
+    init,
+    connect,
+    disconnect,
+    DidResolver as KiltSDKResolver, // Alias the SDK's resolver to avoid name clashes
+} from '@kiltprotocol/sdk-js';
 import type { Did, ResolutionResult } from '@kiltprotocol/types';
 import type { DidResolver as IDidResolver } from '../config';
 
@@ -21,28 +25,37 @@ export class KiltDidResolver implements IDidResolver {
     }
 
     /**
-     * Initializes the connection to the Kilt blockchain via the SDK.
-     * This must be called before using the resolve method. In a client application,
-     * this could be called alongside the main client's connect() method.
+     * Initializes the connection to the Kilt blockchain using the explicit two-step process.
      */
     public async connect(): Promise<void> {
         if (this.isConnected) {
             console.log("KiltDidResolver is already connected.");
             return;
         }
-        // The Kilt SDK v1.0.0+ uses a single init() function which handles the connection.
-        await Kilt.init({ address: this.endpoint });
-        this.isConnected = true;
-        console.log(`KiltDidResolver connected to ${this.endpoint}`);
+
+        // NEW LOGIC: Use the explicit two-step connection pattern.
+        try {
+            console.log(`KiltDidResolver: Connecting to ${this.endpoint}...`);
+            await connect(this.endpoint); // Step 1: Establish the WebSocket connection.
+
+            console.log('KiltDidResolver: Initializing SDK services...');
+            await init(); // Step 2: Initialize the rest of the SDK that depends on the connection.
+
+            this.isConnected = true;
+            console.log(`✅ KiltDidResolver connected and initialized successfully.`);
+        } catch (e) {
+            console.error("Failed to connect or initialize KiltDidResolver", e);
+            throw e;
+        }
     }
 
     /**
      * Disconnects from the Kilt blockchain.
-     * Should be called when the application is shutting down.
      */
     public async disconnect(): Promise<void> {
         if (this.isConnected) {
-            await Kilt.disconnect();
+            // CHANGE: Use the specific disconnect function from the SDK
+            await disconnect();
             this.isConnected = false;
             console.log("KiltDidResolver disconnected.");
         }
@@ -50,24 +63,17 @@ export class KiltDidResolver implements IDidResolver {
 
     /**
      * Resolves a Kilt DID to its DID Document.
-     * This function implements the DidResolver interface for your client.
-     * @param did The Kilt DID to resolve (e.g., 'did:kilt:4...').
-     * @returns The resolution result containing the DID Document and metadata.
-     * @throws Error if the SDK is not connected, or if resolution fails.
      */
     public async resolve(did: Did | string): Promise<ResolutionResult> {
         if (!this.isConnected) {
-            // For robustness, applications should manage the connection state.
-            // For example, by calling connect() on the resolver when the main client connects.
             throw new Error("KiltDidResolver is not connected. Call connect() on the resolver instance first.");
         }
 
         console.log(`Resolving Kilt DID: ${did}`);
-        // The Kilt SDK's resolve function expects a `Did` type, which is a branded string.
-        // Casting the input `string` to `Did` is safe and necessary here.
-        const resolutionResult = await Kilt.DidResolver.resolve(did as Did);
+        // CHANGE: Use the aliased resolver for clarity
+        const resolutionResult = await KiltSDKResolver.resolve(did as Did);
 
-        // Robust error handling, similar to the pattern in your create-test-dids.ts script.
+        // Robust error handling remains the same
         if (resolutionResult.didResolutionMetadata?.error) {
             throw new Error(`DID Resolution error for ${did}: ${resolutionResult.didResolutionMetadata.error}`);
         }

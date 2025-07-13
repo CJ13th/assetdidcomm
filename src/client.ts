@@ -6,6 +6,7 @@ import { ApiPromise, WsProvider } from '@polkadot/api'; // Add to imports
 import type { SubmittableExtrinsic } from '@polkadot/api/types';
 import type { ISubmittableResult, IEventRecord, IEvent } from '@polkadot/types/types';
 import type { ResolutionResult, Did, DidDocument } from '@kiltprotocol/types';
+import { hexToU8a, stringToHex } from '@polkadot/util';
 
 import { createDirectMessage } from 'message-module-js';
 import { encryptJWE, calculateSha256Digest, decryptJWE } from './crypto/encryption';
@@ -15,13 +16,30 @@ import { MOCK_PKB_JWK, MOCK_SKB_JWK } from './crypto/keys'; // Using the mock PK
 import type { JWK } from 'jose';
 import { v4 as uuidv4 } from 'uuid';
 import { KeyringSigner } from './signers/keyring';
+import { Multikey } from '@kiltprotocol/utils';
 
 
-interface OnChainMetadata {
-    // The SHA-256 digest of the JWE message, hex-encoded
-    digest: string;
-    // Optional: any other metadata to include
-    contentType?: string;
+/**
+ * Converts a Uint8Array to a URL-safe Base64 string.
+ * @param data The byte array to encode.
+ * @returns The Base64URL encoded string.
+ */
+function u8aToBase64Url(data: Uint8Array): string {
+    return Buffer.from(data)
+        .toString('base64')
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+        .replace(/=/g, '');
+}
+
+interface ReferenceObject {
+    reference: string; // The actual CID or storage identifier
+    digest: string;    // The sha256 digest of the message
+}
+
+
+interface OnChainMetadataMock {
+    unique: number;
 }
 
 
@@ -58,7 +76,7 @@ export class AssetDidCommClient {
         console.log(`Polkadot API initialized and connected to ${this.config.rpcEndpoint} for signer ${this.config.signer.getAddress()}`);
 
         this.polkadotApi.on('disconnected', () => console.warn(`API disconnected for ${this.config.signer.getAddress()}`));
-        this.polkadotApi.on('error', (error) => console.error(`API error for ${this.config.signer.getAddress()}:`, error));
+        this.polkadotApi.on('error', (error) => console.error(`API error for ${this.config.signer.getAddress()}: `, error));
     }
 
     public async disconnect(): Promise<void> {
@@ -93,7 +111,7 @@ export class AssetDidCommClient {
         return new Promise(async (resolve, reject) => {
             try {
                 const unsubscribe = await extrinsic.signAndSend(keypair, (result: any) => {
-                    console.log(`Transaction status: ${result.status.type}`);
+                    console.log(`Transaction status: ${result.status.type} `);
 
                     if (result.status.isInBlock || result.status.isFinalized) {
                         const foundEvent = result.events.find(({ event }) => eventFinder(event));
@@ -101,7 +119,7 @@ export class AssetDidCommClient {
                         if (foundEvent) {
                             const validatedData = eventValidator(foundEvent);
                             if (validatedData !== null) {
-                                console.log(`✅ Event found and validated: ${foundEvent.event.section}.${foundEvent.event.method}`);
+                                console.log(`✅ Event found and validated: ${foundEvent.event.section}.${foundEvent.event.method} `);
                                 unsubscribe();
                                 resolve({
                                     data: validatedData,
@@ -112,7 +130,7 @@ export class AssetDidCommClient {
                         }
 
                         if (result.status.isFinalized) {
-                            console.log(`Blockhash: ${result.status.asFinalized}`);
+                            console.log(`Blockhash: ${result.status.asFinalized} `);
                             unsubscribe();
                             // If it finalizes without our event, something went wrong.
                             reject(new Error("Transaction finalized, but the expected event was not found or was invalid."));
@@ -121,7 +139,7 @@ export class AssetDidCommClient {
                         let errorMessage = "Transaction submission error.";
                         if (result.dispatchError?.isModule) {
                             const decoded = this.polkadotApi!.registry.findMetaError(result.dispatchError.asModule);
-                            errorMessage = `Transaction failed: ${decoded?.name} - ${decoded?.docs.join(' ')}`;
+                            errorMessage = `Transaction failed: ${decoded?.name} - ${decoded?.docs.join(' ')} `;
                         }
                         unsubscribe();
                         reject(new Error(errorMessage));
@@ -237,7 +255,7 @@ export class AssetDidCommClient {
         messageContent: string,
         tag: string = "direct_message_v1" // Example default tag
     ): Promise<{ messageIdOnChain: string, storageIdentifier: string, jwe: string }> {
-        console.log(`Attempting to send direct message to ${recipientDid} for entity ${entityId}, bucket ${bucketId}`);
+        console.log(`Attempting to send direct message to ${recipientDid} for entity ${entityId}, bucket ${bucketId} `);
 
         // 1. Fetch the Public Key of the Bucket (PKB)
         const pkbJwk = await this.fetchBucketPublicKey(entityId, bucketId);
@@ -287,21 +305,19 @@ export class AssetDidCommClient {
             console.error("Error uploading to storage:", e);
             throw new Error("Failed to upload encrypted message to storage.");
         }
-        console.log(`Encrypted message stored at: ${storageIdentifier}`);
+        console.log(`Encrypted message stored at: ${storageIdentifier} `);
 
         // 5. Calculate Digest and construct the new metadata object
         const digestHex = await calculateSha256Digest(jweString);
-        console.log(`Digest of JWE (to be stored in metadata): ${digestHex}`);
+        console.log(`Digest of JWE(to be stored in metadata): ${digestHex} `);
 
-        // NEW: The digest is now part of this structured metadata object.
-        const metadataObject: OnChainMetadata = {
-            digest: digestHex,
-            contentType: 'application/didcomm+json'
+        const metadataObject: OnChainMetadataMock = {
+            unique: Math.floor(Math.random() * 1_000_000_000),
         };
 
         // 6. Submit Message Reference and the new metadata to Substrate Pallet
         const palletMessageData = {
-            reference: storageIdentifier,
+            referenceObj: { reference: storageIdentifier, digest: digestHex },
             tag: tag,
             // CHANGED: We now pass the entire metadata object.
             metadata: metadataObject,
@@ -310,12 +326,14 @@ export class AssetDidCommClient {
         let messageIdOnChain: string;
         try {
             // The call to submitToPallet is now updated with the new payload structure
-            messageIdOnChain = await this.submitToPallet(entityId, bucketId, palletMessageData);
+            const { txHash } = await this.submitToPallet(entityId, bucketId, palletMessageData);
+            messageIdOnChain = txHash;
+
         } catch (e) {
             console.error("Error submitting to pallet:", e);
             throw new Error("Failed to submit message metadata to the blockchain.");
         }
-        console.log(`Message metadata submitted to pallet. On-chain ID/TxHash: ${messageIdOnChain}`);
+        console.log(`Message metadata submitted to pallet.On - chain ID / TxHash: ${messageIdOnChain} `);
 
         return { messageIdOnChain, storageIdentifier, jwe: jweString };
     }
@@ -345,7 +363,7 @@ export class AssetDidCommClient {
         const bucketInfo = bucketInfoRaw.unwrap();
         if (bucketInfo.status.isWritable) {
             const keyId = bucketInfo.status.asWritable.toNumber();
-            console.log(`Bucket is writable with keyId: ${keyId}. Now resolving off-chain...`);
+            console.log(`Bucket is writable with keyId: ${keyId}. Now resolving off - chain...`);
 
             // 2. Resolve the keyId to a full JWK using our file-based discovery for the E2E test.
             // In a real system, this would be a call to a DID resolver or a dedicated key discovery service.
@@ -357,18 +375,18 @@ export class AssetDidCommClient {
                 const publicKeyJwk = keyState[keyId];
 
                 if (!publicKeyJwk) {
-                    throw new Error(`Key ID ${keyId} not found in e2e-keys.json.`);
+                    throw new Error(`Key ID ${keyId} not found in e2e - keys.json.`);
                 }
                 console.log(`✅ Successfully resolved keyId ${keyId} to a JWK.`);
                 return publicKeyJwk as JWK;
 
             } catch (error) {
-                console.error(`Error resolving keyId ${keyId} from off-chain store:`, error);
+                console.error(`Error resolving keyId ${keyId} from off - chain store: `, error);
                 return null;
             }
 
         } else {
-            console.warn(`Bucket ${bucketId} is locked. No public key available.`);
+            console.warn(`Bucket ${bucketId} is locked.No public key available.`);
             return null;
         }
     }
@@ -377,23 +395,27 @@ export class AssetDidCommClient {
     private async submitToPallet(
         entityId: number,
         bucketId: number,
-        // CHANGED: The signature now expects our structured OnChainMetadata object.
-        messageData: { reference: string; tag: string; metadata: OnChainMetadata }
-    ): Promise<string> {
+        // The messageData now contains our structured ReferenceObject
+        messageData: { referenceObj: ReferenceObject; tag: string | null; metadata: OnChainMetadataMock }
+    ): Promise<{ txHash: string }> {
         if (!this.polkadotApi) throw new Error("Polkadot API not initialized.");
 
-        // This object must precisely match the pallet's `MessageInput` struct.
+
+        // 1. Serialize the reference object containing the CID and digest into a JSON string.
+        const referenceJson = JSON.stringify(messageData.referenceObj);
+
+        // 2. Convert the JSON string to its 0x-prefixed hex representation.
+        const referenceHex = stringToHex(referenceJson);
+
         const messageInput = {
-            reference: messageData.reference,
-            // The pallet expects an Option<Tag>, so we pass the tag or null.
-            tag: messageData.tag || null,
-            // The API will encode this string into a Vec<u8> for the pallet.
-            metadata_input: JSON.stringify(messageData.metadata)
+            reference: referenceHex,
+            tag: messageData.tag ? stringToHex(messageData.tag) : null,
+            // We still have to provide the metadata object the testnet expects.
+            metadataInput: messageData.metadata,
         };
 
         const extrinsic = this.polkadotApi.tx.buckets.write(entityId, bucketId, messageInput);
 
-        // This part remains unchanged as it correctly handles submission and event watching.
         const { txHash } = await this._submitAndWatch(
             extrinsic,
             (event) => this.polkadotApi!.events.buckets.NewMessage.is(event),
@@ -405,7 +427,7 @@ export class AssetDidCommClient {
                 return null;
             }
         );
-        return txHash;
+        return { txHash };
     }
 
     /**
@@ -423,7 +445,7 @@ export class AssetDidCommClient {
         bucketId: number,
         storageIdentifier: string
     ): Promise<Record<string, any>> { // Return type is a generic object, could be more specific
-        console.log(`Attempting to receive and decrypt message from ${storageIdentifier} for entity ${entityId}, bucket ${bucketId}`);
+        console.log(`Attempting to receive and decrypt message from ${storageIdentifier} for entity ${entityId}, bucket ${bucketId} `);
 
         // 1. Fetch the Secret Key of the Bucket (SKB)
         // For now, this is mocked. Later, this will involve secure SKB retrieval/management.
@@ -437,8 +459,8 @@ export class AssetDidCommClient {
         try {
             encryptedPayloadBytes = await this.config.storageAdapter.download(storageIdentifier);
         } catch (e) {
-            console.error(`Error downloading message from storage (ID: ${storageIdentifier}):`, e);
-            throw new Error(`Failed to download message from storage: ${storageIdentifier}`);
+            console.error(`Error downloading message from storage(ID: ${storageIdentifier}): `, e);
+            throw new Error(`Failed to download message from storage: ${storageIdentifier} `);
         }
 
         const jweString = new TextDecoder().decode(encryptedPayloadBytes);
@@ -450,7 +472,7 @@ export class AssetDidCommClient {
             decryptedPlaintextBytes = await decryptJWE(jweString, skbJwk);
         } catch (e) {
             // Error already logged in decryptJWE, rethrow specific error or generic
-            console.error(`Error decrypting JWE from ${storageIdentifier}:`, e);
+            console.error(`Error decrypting JWE from ${storageIdentifier}: `, e);
             throw new Error(`Failed to decrypt message from ${storageIdentifier}. Ensure you have the correct secret key and the message is not corrupted.`);
         }
 
@@ -481,7 +503,7 @@ export class AssetDidCommClient {
     private async fetchBucketSecretKey(entityId: number, bucketId: number): Promise<JWK | null> {
         console.warn(
             `Fetching SKB for entity ${entityId}, bucket ${bucketId} - MOCK IMPLEMENTATION. ` +
-            `This is highly insecure for a real system. Using MOCK_SKB_JWK.`
+            `This is highly insecure for a real system.Using MOCK_SKB_JWK.`
         );
         // TODO: Implement actual secure SKB retrieval mechanism.
         // This will likely involve:
@@ -493,88 +515,105 @@ export class AssetDidCommClient {
 
     /**
      * Creates and distributes a bucket's secret key (SKB) to a list of readers.
-     * This creates a special key-sharing message, encrypts it for all readers
-     * (and the bucket's own new public key), and writes it to the bucket.
-     *
-     * @param entityId The parent entity ID.
-     * @param bucketId The bucket ID.
-     * @param bucketKeys The key pair (PKB/SKB) for the bucket.
-     * @param readerDids A list of DIDs for the users who should receive the key.
-     * @returns The on-chain message ID (tx hash) and the storage identifier (CID).
+     * This function correctly parses a standard W3C KILT DID Document to find and
+     * convert the keyAgreement key for encryption.
      */
     public async shareBucketKey(
         entityId: number,
         bucketId: number,
-        bucketKeys: { publicJwk: JWK, secretJwk: JWK },
+        bucketKeys: { publicJwk: JWK; secretJwk: JWK },
         readerDids: Did[] | string[]
-    ): Promise<any> {
+    ): Promise<{ messageIdOnChain: string; storageIdentifier: string }> {
         console.log(`Sharing bucket key for bucket ${bucketId} with ${readerDids.length} readers.`);
 
+        // 1. Prepare the key-sharing DIDComm message (this part is correct)
         const skbForWasm = bucketKeys.secretJwk;
-        if (!skbForWasm.kty || !skbForWasm.crv || !skbForWasm.x || !skbForWasm.y || !skbForWasm.d || !skbForWasm.use) {
-            throw new Error("The generated secret JWK is missing required properties.");
+        if (!skbForWasm.kty || !skbForWasm.crv || !skbForWasm.x || !skbForWasm.d || !skbForWasm.use) {
+            throw new Error("The provided secret JWK is missing required properties.");
+        }
+        const wasmCompatibleKey = { kty: skbForWasm.kty, crv: skbForWasm.crv, x: skbForWasm.x, d: skbForWasm.d, y: '', use: skbForWasm.use, kid: skbForWasm.kid || `skb-for-bucket-${bucketId}` };
+        const keySharingMsgString = createKeySharingMessage({ id: uuidv4(), from: this.config.signer.getAddress(), to: readerDids, keys: [wasmCompatibleKey] });
+        const plaintextBytes = new TextEncoder().encode(keySharingMsgString);
+        console.log("Constructed Key-Sharing Message:", JSON.parse(keySharingMsgString));
+
+        // 2. Resolve Reader DIDs and construct their JWKs
+        const recipientKeys: JWK[] = [bucketKeys.publicJwk];
+        for (const did of readerDids) {
+            console.log(`Resolving DID for reader: ${did} `);
+            const resolutionResult = await this.config.didResolver.resolve(did as Did);
+            const didDocument = resolutionResult.didDocument;
+
+            if (!didDocument || !didDocument.keyAgreement || !didDocument.verificationMethod) {
+                console.warn(`DID Document for ${did} is missing keyAgreement or verificationMethod.Skipping.`);
+                continue;
+            }
+
+            // --- FINAL, CORRECT PARSING LOGIC ---
+            // 1. Get the key reference URI from the keyAgreement section.
+            const keyAgreementRef = didDocument.keyAgreement[0];
+
+            // 2. Find the corresponding key object in the verificationMethod list.
+            const keyAgreementMethod = didDocument.verificationMethod.find((vm) => vm.id === keyAgreementRef);
+
+            if (!keyAgreementMethod?.publicKeyMultibase) {
+                console.warn(`Could not find a verification method with a publicKeyMultibase for ${keyAgreementRef}.Skipping.`);
+                continue;
+            }
+
+            // 3. Decode the multibase key to get its raw bytes.
+            const decodedKey = Multikey.decodeMultibaseKeypair(keyAgreementMethod);
+            const publicKeyBytes = decodedKey.publicKey;
+
+            // 4. Convert the raw bytes to a Base64URL string.
+            const publicKeyBase64Url = u8aToBase64Url(publicKeyBytes);
+
+            // 5. Construct the final JWK needed for the 'jose' library.
+            const recipientJwk: JWK = {
+                kty: 'OKP',
+                crv: 'X25519', // KILT's encryption key is X25519
+                x: publicKeyBase64Url,
+                use: 'enc',
+            };
+            // --- END FINAL LOGIC ---
+
+            recipientKeys.push(recipientJwk);
+            console.log(`✅ Successfully processed key ${keyAgreementRef} for encryption.`);
         }
 
-        const wasmCompatibleKey = {
-            kty: skbForWasm.kty,
-            crv: skbForWasm.crv,
-            x: skbForWasm.x,
-            y: skbForWasm.y,
-            d: skbForWasm.d,
-            use: skbForWasm.use, // Correctly map 'use' to '_use'
-            kid: skbForWasm.kid || `skb-for-bucket-${bucketId}`,
+        if (recipientKeys.length <= 1) {
+            throw new Error("No valid reader DIDs could be resolved to public keys for encryption.");
+        }
+
+        const jweObject = await encryptJWEForMultipleRecipients(plaintextBytes, recipientKeys);
+        const jweString = JSON.stringify(jweObject);
+        const storageIdentifier = await this.config.storageAdapter.upload(jweString);
+        console.log(`Key-sharing message uploaded to storage at: ${storageIdentifier}`);
+
+        // 6. Calculate digest and prepare the overloaded reference object
+        const digestHex = await calculateSha256Digest(jweString);
+        const referenceObj: ReferenceObject = {
+            reference: storageIdentifier,
+            digest: digestHex,
         };
 
-        // 1. Create the DIDComm Key-Sharing Message (using WASM module)
-        const keySharingMsgString = createKeySharingMessage({
-            id: uuidv4(),
-            from: this.config.signer.getAddress(),
-            to: readerDids,
-            keys: [
-                wasmCompatibleKey
-            ]
-        });
-        const keySharingMsgObject = JSON.parse(keySharingMsgString);
-        const plaintextBytes = new TextEncoder().encode(JSON.stringify(keySharingMsgObject));
-        console.log("Constructed Key-Sharing Message:", keySharingMsgObject);
+        // Prepare the mock metadata that the testnet requires
+        const metadataObject: OnChainMetadataMock = {
+            unique: Math.floor(Math.random() * 1_000_000_000),
+        };
 
-        // 2. Resolve Reader DIDs to get their public keys for encryption
-        const recipientKeys: JWK[] = [bucketKeys.publicJwk]; // Bucket can always decrypt its own key messages
-        for (const did of readerDids) {
-            console.log(`Resolving DID for reader: ${did}`);
-            const resolutionResult = await this.config.didResolver.resolve(did as Did); // Use the configured resolver
-
-            const didDocument = resolutionResult.didDocument;
-            didDocument?.verificationMethod[0].publicKeyMultibase
-
-            if (!didDocument || !didDocument.keyAgreement || didDocument.keyAgreement.length === 0) {
-                console.warn(`Could not find a valid keyAgreement key for DID: ${did}. Skipping.`);
-                continue;
+        // 7. Submit the overloaded reference and mock metadata to the pallet
+        console.log("Submitting overloaded reference to the pallet...");
+        const { txHash } = await this.submitToPallet(
+            entityId,
+            bucketId,
+            {
+                referenceObj: referenceObj, // Pass the new object here
+                tag: 'didcomm/key-sharing-v1',
+                metadata: metadataObject,
             }
-            const keyAgreementEntry = didDocument.keyAgreement.find(
-                (key: any) => key.publicKeyJwk
-            );
+        );
 
-            if (!keyAgreementEntry || !keyAgreementEntry.publicKeyJwk) {
-                console.warn(`No suitable publicKeyJwk found in keyAgreement for DID: ${did}. Skipping.`);
-                continue;
-            }
-
-            console.log(`Found keyAgreement key for ${did}: ${keyAgreementEntry.id}`);
-            recipientKeys.push(keyAgreementEntry.publicKeyJwk as JWK);
-        }
-
-        // Ensure we have recipients other than the bucket itself
-        if (recipientKeys.length <= 1) {
-            throw new Error("No valid reader DIDs could be resolved to public keys.");
-        }
-
-        // 3. Encrypt for multiple recipients
-        const jweObject = await encryptJWEForMultipleRecipients(plaintextBytes, recipientKeys);
-
-        // TODO: Complete this function by uploading JWE and submitting to pallet
-        console.warn("shareBucketKey is incomplete: JWE is created but not uploaded or submitted to the chain.");
-        return { jweObject }
+        return { messageIdOnChain: txHash, storageIdentifier };
     }
 
     /**
@@ -602,14 +641,20 @@ export class AssetDidCommClient {
             .filter(msg => msg.tag === "didcomm/key-sharing-v1"); // Use a specific tag for key sharing
 
         if (keySharingMessages.length === 0) {
-            throw new Error(`No key-sharing message found in bucket ${bucketId}.`);
+            throw new Error(`No key - sharing message found in bucket ${bucketId}.`);
         }
 
         const keyMessageInfo = keySharingMessages.sort((a, b) => b.id - a.id)[0];
-        console.log(`Found key-sharing message at CID: ${keyMessageInfo.reference}`);
+
+        const referenceObj: ReferenceObject = JSON.parse(keyMessageInfo.reference);
+        const cid = referenceObj.reference;
+        const onChainDigest = referenceObj.digest;
+
+        console.log(`Found key-sharing message. CID: ${cid}, On-Chain Digest: ${onChainDigest}`);
+        // console.log(`Found key - sharing message at CID: ${keyMessageInfo.reference} `);
 
         // 2. Download the JWE from storage
-        const jweBytes = await this.config.storageAdapter.download(keyMessageInfo.reference);
+        const jweBytes = await this.config.storageAdapter.download(cid);
         const jweObject = JSON.parse(new TextDecoder().decode(jweBytes));
 
         // 3. Decrypt using the reader's private key
@@ -831,7 +876,7 @@ export class AssetDidCommClient {
             (event) => this.polkadotApi!.events.buckets.NewTag.is(event),
             (eventRecord) => {
                 const [eventBucketId, eventTag] = eventRecord.event.data;
-                if ((eventBucketId as any).toNumber() === bucketId && eventTag.toString() === tag) {
+                if ((eventBucketId as any).toNumber() === bucketId && eventTag.toUtf8() === tag) {
                     return { success: true };
                 }
                 return null;
