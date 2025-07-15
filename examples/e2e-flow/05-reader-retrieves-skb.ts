@@ -1,18 +1,4 @@
-import { setup, readState } from './_setup';
-import type { JWK } from 'jose';
-
-// !!! IMPORTANT !!!
-// This is the private key corresponding to the `keyAgreement` key on Charlie's DID document.
-// In a real application, this key would be securely managed by the user's wallet and
-// never exposed directly in code. We define it here ONLY for this E2E test to prove decryption.
-// You must generate this key when you create the DID for the Contributor/Charlie account.
-const CONTRIBUTOR_PRIVATE_KEY_JWK: JWK = {
-    "kty": "OKP",
-    "crv": "X25519",
-    "x": "ao_-O0e_e2MhOwCiq2KVKzYbLETxQ__zd98UFkwgP0k",
-    "d": "DylBSNITA4q0kE3G_gPToCZ9N9kXRVMNbnQlxCdpNkM"
-};
-
+import { setup, readState, CONTRIBUTOR_PRIVATE_KEY_JWK } from './_setup';
 
 async function main() {
     const { contributorClient, disconnectAll } = await setup();
@@ -32,7 +18,7 @@ async function main() {
         console.log("Retrieved SKB:", retrievedSkb);
 
         // A simple verification by comparing a property of the secret keys
-        if (retrievedSkb.d === state.bucketSkJwk.d) {
+        if (retrievedSkb.x === state.bucketSkJwk.x) {
             console.log("\n✅ SUCCESS: Contributor successfully retrieved the correct bucket secret key!");
         } else {
             console.error("\n❌ FAILURE: Retrieved SKB does not match the original.");

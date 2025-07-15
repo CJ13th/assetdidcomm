@@ -51,7 +51,7 @@ async function main() {
             id: 'test-message-123',
             from: 'did:example:admin',
             to: ['did:example:bucket', 'did:example:reader'],
-            keys: [wasmCompatibleSkb!],
+            keys: [wasmCompatibleSkb],
         });
         const plaintextBytes = new TextEncoder().encode(keySharingMsgString);
         console.log("Plaintext message created.");

@@ -1,4 +1,4 @@
-import { setup, readState, ADMIN_DID, CONTRIBUTOR_DID } from './_setup';
+import { setup, readState, ADMIN_DID, CONTRIBUTOR_DID, MANAGER_DID } from './_setup';
 
 async function main() {
     // We need both manager and admin clients for this step
@@ -24,6 +24,11 @@ async function main() {
         console.log(`\n--- [ADMIN] 3c.  Admin grants self Contributor role - Assigning Contributor (${ADMIN_DID}) to Bucket ${state.bucketId} ---`);
         const adminAsContributorTxHash = await adminClient.addContributor(state.namespaceId, state.bucketId, ADMIN_DID);
         console.log(`✅ Admin assigned as Contributor successfully. Transaction Hash: ${adminAsContributorTxHash}`);
+
+        // --- Step 6: Assign Contributor by Admin ---
+        console.log(`\n--- [ADMIN] 3d.  Admin grants the Manager Contributor role - Assigning Contributor (${MANAGER_DID}) to Bucket ${state.bucketId} ---`);
+        const managerAsContributorTxHash = await adminClient.addContributor(state.namespaceId, state.bucketId, MANAGER_DID);
+        console.log(`✅ Manager assigned as Contributor successfully. Transaction Hash: ${managerAsContributorTxHash}`);
 
     } catch (error) {
         console.error("\n❌ Error in Step 3: Assign Roles", error);

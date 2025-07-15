@@ -6,9 +6,9 @@ import { ApiPromise, WsProvider } from '@polkadot/api'; // Add to imports
 import type { SubmittableExtrinsic } from '@polkadot/api/types';
 import type { ISubmittableResult, IEventRecord, IEvent } from '@polkadot/types/types';
 import type { ResolutionResult, Did, DidDocument } from '@kiltprotocol/types';
-import { hexToU8a, stringToHex } from '@polkadot/util';
+import { hexToU8a, stringToHex, u8aToHex } from '@polkadot/util';
 
-import { createDirectMessage } from 'message-module-js';
+import { createDirectMessage, createMediaItemMessage, MediaItemReferenced } from 'message-module-js';
 import { encryptJWE, calculateSha256Digest, decryptJWE } from './crypto/encryption';
 import { createKeySharingMessage } from 'message-module-js';
 import { encryptJWEForMultipleRecipients, decryptGeneralJWE } from './crypto/encryption';
@@ -42,10 +42,19 @@ interface OnChainMetadataMock {
     unique: number;
 }
 
+interface DecryptedMessage {
+    messageId: number;
+    onChainSubmitter: string;
+    [key: string]: any;
+}
+
 
 export class AssetDidCommClient {
-    private config: AssetDidCommClientConfig;
+    public config: AssetDidCommClientConfig;
     public polkadotApi?: ApiPromise;
+    public readonly storageAdapter: StorageAdapter;
+    public readonly signer: Signer;
+
     constructor(config: AssetDidCommClientConfig) {
         if (!config.storageAdapter) {
             throw new Error("StorageAdapter is required in config.");
@@ -57,6 +66,8 @@ export class AssetDidCommClient {
             throw new Error("Signer is required in config.");
         }
         this.config = config;
+        this.storageAdapter = config.storageAdapter;
+        this.signer = config.signer;
 
     }
 
@@ -253,7 +264,7 @@ export class AssetDidCommClient {
         bucketId: number,
         recipientDid: string,
         messageContent: string,
-        tag: string = "direct_message_v1" // Example default tag
+        tag?: string
     ): Promise<{ messageIdOnChain: string, storageIdentifier: string, jwe: string }> {
         console.log(`Attempting to send direct message to ${recipientDid} for entity ${entityId}, bucket ${bucketId} `);
 
@@ -396,7 +407,7 @@ export class AssetDidCommClient {
         entityId: number,
         bucketId: number,
         // The messageData now contains our structured ReferenceObject
-        messageData: { referenceObj: ReferenceObject; tag: string | null; metadata: OnChainMetadataMock }
+        messageData: { referenceObj: ReferenceObject; tag: string | undefined; metadata: OnChainMetadataMock }
     ): Promise<{ txHash: string }> {
         if (!this.polkadotApi) throw new Error("Polkadot API not initialized.");
 
@@ -443,13 +454,14 @@ export class AssetDidCommClient {
     public async receiveMessageByCid(
         entityId: number,
         bucketId: number,
-        storageIdentifier: string
+        storageIdentifier: string,
+        readerPrivateKey: JWK
     ): Promise<Record<string, any>> { // Return type is a generic object, could be more specific
         console.log(`Attempting to receive and decrypt message from ${storageIdentifier} for entity ${entityId}, bucket ${bucketId} `);
 
         // 1. Fetch the Secret Key of the Bucket (SKB)
         // For now, this is mocked. Later, this will involve secure SKB retrieval/management.
-        const skbJwk = await this.fetchBucketSecretKey(entityId, bucketId);
+        const skbJwk = await this.retrieveBucketSecretKey(entityId, readerPrivateKey);
         if (!skbJwk) {
             throw new Error(`Could not obtain SKB for bucket ${bucketId} under entity ${entityId}. Decryption not possible.`);
         }
@@ -489,31 +501,6 @@ export class AssetDidCommClient {
     }
 
     /**
-     * Fetches the Secret Key of the Bucket (SKB).
-     *
-     * !!! THIS IS A HIGHLY SENSITIVE OPERATION AND MOCKED FOR NOW !!!
-     * In a real system, SKB is never fetched like this directly.
-     * It's usually obtained by decrypting a key-sharing message specific to the user,
-     * or managed by a secure enclave / wallet.
-     *
-     * @param entityId The ID of the entity.
-     * @param bucketId The ID of the bucket.
-     * @returns The SKB in JWK format, or null if not found/accessible.
-     */
-    private async fetchBucketSecretKey(entityId: number, bucketId: number): Promise<JWK | null> {
-        console.warn(
-            `Fetching SKB for entity ${entityId}, bucket ${bucketId} - MOCK IMPLEMENTATION. ` +
-            `This is highly insecure for a real system.Using MOCK_SKB_JWK.`
-        );
-        // TODO: Implement actual secure SKB retrieval mechanism.
-        // This will likely involve:
-        // 1. Checking if we have a cached SKB for this bucketId.
-        // 2. If not, looking for key-sharing messages in this or a parent/admin bucket.
-        // 3. Decrypting a key-sharing message using the user's own private key.
-        return MOCK_SKB_JWK;
-    }
-
-    /**
      * Creates and distributes a bucket's secret key (SKB) to a list of readers.
      * This function correctly parses a standard W3C KILT DID Document to find and
      * convert the keyAgreement key for encryption.
@@ -528,10 +515,10 @@ export class AssetDidCommClient {
 
         // 1. Prepare the key-sharing DIDComm message (this part is correct)
         const skbForWasm = bucketKeys.secretJwk;
-        if (!skbForWasm.kty || !skbForWasm.crv || !skbForWasm.x || !skbForWasm.d || !skbForWasm.use) {
+        if (!skbForWasm.kty || !skbForWasm.crv || !skbForWasm.x || !skbForWasm.use) {
             throw new Error("The provided secret JWK is missing required properties.");
         }
-        const wasmCompatibleKey = { kty: skbForWasm.kty, crv: skbForWasm.crv, x: skbForWasm.x, d: skbForWasm.d, y: '', use: skbForWasm.use, kid: skbForWasm.kid || `skb-for-bucket-${bucketId}` };
+        const wasmCompatibleKey = { kty: skbForWasm.kty, crv: skbForWasm.crv, x: skbForWasm.x, d: '', y: '', use: skbForWasm.use, kid: skbForWasm.kid || `skb-for-bucket-${bucketId}` };
         const keySharingMsgString = createKeySharingMessage({ id: uuidv4(), from: this.config.signer.getAddress(), to: readerDids, keys: [wasmCompatibleKey] });
         const plaintextBytes = new TextEncoder().encode(keySharingMsgString);
         console.log("Constructed Key-Sharing Message:", JSON.parse(keySharingMsgString));
@@ -574,7 +561,6 @@ export class AssetDidCommClient {
                 x: publicKeyBase64Url,
                 use: 'enc',
             };
-            // --- END FINAL LOGIC ---
 
             recipientKeys.push(recipientJwk);
             console.log(`✅ Successfully processed key ${keyAgreementRef} for encryption.`);
@@ -651,11 +637,20 @@ export class AssetDidCommClient {
         const onChainDigest = referenceObj.digest;
 
         console.log(`Found key-sharing message. CID: ${cid}, On-Chain Digest: ${onChainDigest}`);
-        // console.log(`Found key - sharing message at CID: ${keyMessageInfo.reference} `);
 
         // 2. Download the JWE from storage
         const jweBytes = await this.config.storageAdapter.download(cid);
         const jweObject = JSON.parse(new TextDecoder().decode(jweBytes));
+
+        console.log("Verifying content integrity against on-chain digest...");
+
+        const calculatedDigest = await calculateSha256Digest(jweBytes);
+
+        if (calculatedDigest !== onChainDigest) {
+            throw new Error(`Integrity check failed! The digest of the downloaded content... does not match the on-chain digest...`);
+        }
+
+        console.log("✅ Content integrity verified.");
 
         // 3. Decrypt using the reader's private key
         const decryptedBytes = await decryptGeneralJWE(jweObject, readerPrivateKeyJwk);
@@ -960,5 +955,219 @@ export class AssetDidCommClient {
             }
         );
         return txHash;
+    }
+
+    /**
+     * Encrypts a media file, uploads it, and writes a DIDComm reference message to a bucket.
+     * This method implements the "referenced" or "detached" media sharing pattern.
+     *
+     * @param entityId The parent entity ID.
+     * @param bucketId The bucket ID.
+     * @param file The file to send, including its content and metadata.
+     * @returns The on-chain message ID and the CID of the uploaded encrypted media file.
+     */
+    public async sendMediaMessage(
+        entityId: number,
+        bucketId: number,
+        file: {
+            content: Uint8Array; // Raw file content
+            mediaType: string;   // e.g., 'image/png', 'application/pdf'
+            fileName?: string;
+            description?: string;
+        }
+    ): Promise<{ messageIdOnChain: string; mediaCid: string }> {
+        console.log(`\n--- Sending referenced media message for file: ${file.fileName || 'untitled'} ---`);
+
+        // === Layer 1: Encrypt the Media File Itself ===
+
+        // 1. Generate a new, single-use symmetric key (mediaCEK) and IV for the file.
+        const mediaCEK = await crypto.subtle.generateKey(
+            { name: 'AES-GCM', length: 256 },
+            true, // Allow the key to be extractable
+            ['encrypt', 'decrypt']
+        );
+        const iv = crypto.getRandomValues(new Uint8Array(12)); // AES-GCM standard IV size
+
+        // 2. Encrypt the file content with the new mediaCEK.
+        const encryptedMediaBytes = await crypto.subtle.encrypt(
+            { name: 'AES-GCM', iv: iv },
+            mediaCEK,
+            file.content
+        );
+        console.log(`[1/7] File content encrypted successfully with a new symmetric key.`);
+
+        // 3. Upload the *encrypted* media file to storage.
+        const mediaCid = await this.config.storageAdapter.upload(new Uint8Array(encryptedMediaBytes));
+        console.log(`[2/7] Encrypted media file uploaded to storage. CID: ${mediaCid}`);
+
+
+        // === Layer 2: Securely Transmit the mediaCEK ===
+
+        // 4. Encrypt the mediaCEK for the bucket.
+        const pkbJwk = await this.fetchBucketPublicKey(entityId, bucketId);
+        if (!pkbJwk) {
+            throw new Error(`Cannot send media message: Could not fetch public key for bucket ${bucketId}.`);
+        }
+
+        const rawMediaCekBytes = await crypto.subtle.exportKey('raw', mediaCEK);
+        // We encrypt the raw key bytes using a standard JWE.
+        const encryptedMediaCekJwe = await encryptJWE(new Uint8Array(rawMediaCekBytes), pkbJwk);
+        console.log(`[3/7] Symmetric key (mediaCEK) has been encrypted for the bucket.`);
+
+
+        // === Layer 3: Construct and Encrypt the Main DIDComm Message ===
+
+        // 5. Construct the MediaItemReferenced object.
+        const fileHash = await calculateSha256Digest(file.content);
+        const mediaItem: MediaItemReferenced = {
+            id: uuidv4(),
+            media_type: file.mediaType,
+            filename: file.fileName,
+            description: file.description,
+            link: `ipfs://${mediaCid}`,
+            hash: `sha2-256:${fileHash}`, // Use a standard hash format prefix
+            ciphering: {
+                algorithm: 'AES-GCM',
+                parameters: {
+                    iv: u8aToHex(iv),
+                    // The 'key' is the JWE-wrapped mediaCEK. The receiver will need the SKB to decrypt this.
+                    key: encryptedMediaCekJwe,
+                }
+            }
+        };
+
+        // 6. Create the full DIDComm message using the WASM module.
+        const didCommMessageString = createMediaItemMessage({
+            id: uuidv4(),
+            to: [], // 'to' is optional, encryption is for the bucket
+            from: this.config.signer.getAddress(),
+            mediaItems: [mediaItem]
+        });
+        console.log(`[4/7] Main DIDComm message constructed.`);
+
+        // 7. Encrypt the entire DIDComm message for the bucket.
+        const finalJweString = await encryptJWE(new TextEncoder().encode(didCommMessageString), pkbJwk);
+        console.log(`[5/7] Main DIDComm message has been encrypted for the bucket.`);
+
+
+        // === Final Step: Upload and Submit to Pallet ===
+
+        const outerJweCid = await this.config.storageAdapter.upload(finalJweString);
+        console.log(`[6/7] Final encrypted message uploaded to storage. CID: ${outerJweCid}`);
+
+        const digestHex = await calculateSha256Digest(finalJweString);
+        const referenceObj: ReferenceObject = {
+            reference: outerJweCid,
+            digest: digestHex,
+        };
+
+        const metadataObject: OnChainMetadataMock = {
+            unique: Math.floor(Math.random() * 1_000_000_000),
+        };
+
+        console.log("[7/7] Submitting final message reference to the pallet...");
+        const { txHash } = await this.submitToPallet(
+            entityId,
+            bucketId,
+            {
+                referenceObj: referenceObj,
+                tag: 'didcomm/media-sharing-v1', // Use a dedicated tag
+                metadata: metadataObject,
+            }
+        );
+
+        return { messageIdOnChain: txHash, mediaCid: mediaCid };
+    }
+
+
+
+    /**
+     * Retrieves all messages from a bucket, decrypts them, and returns them in a structured format.
+     * This is the primary method for fetching a "feed" for a bucket.
+     *
+     * @param bucketId The ID of the bucket to fetch messages from.
+     * @param readerPrivateKeyJwk The private key of the user fetching the messages, used for decryption.
+     * @returns A promise that resolves to an array of processed messages.
+     */
+    public async retrieveBucketMessages(
+        bucketId: number,
+        readerPrivateKeyJwk: JWK,
+    ): Promise<any[]> {
+        if (!this.polkadotApi) throw new Error("Polkadot API not initialized.");
+
+        console.log(`\n--- Retrieving all messages for bucket ${bucketId} ---`);
+
+        const messageEntries = await this.polkadotApi.query.buckets.messages.entries(bucketId);
+
+        if (messageEntries.length === 0) {
+            console.log("No messages found in this bucket.");
+            return [];
+        }
+
+        console.log(`Found ${messageEntries.length} raw message entries. Processing...`);
+
+        const skb = await this.retrieveBucketSecretKey(bucketId, readerPrivateKeyJwk);
+        if (!skb) {
+            throw new Error(`Could not retrieve the Secret Bucket Key for bucket ${bucketId}. Cannot decrypt messages.`);
+        }
+
+        const processedMessages: DecryptedMessage[] = [];
+
+        for (const [key, value] of messageEntries) {
+            try {
+                const messageId = (key.args[1] as any).toNumber();
+                // The .toPrimitive() method conveniently converts pallet types to JS types.
+                // The actual message data is nested inside the Option<Message> struct.
+                console.log(value.toPrimitive());
+
+                const onChainMessage = (value.toPrimitive() as any).reference;
+                console.log(onChainMessage);
+                if (!onChainMessage) {
+                    console.warn(`[Message ${messageId}] Message data is empty. Skipping.`);
+                    continue;
+                }
+
+                // // 3. Decode the ReferenceObject from its on-chain hex format.
+                // // Step 3a: Convert the 0x-prefixed hex string to a byte array (Uint8Array).
+                // const referenceBytes = hexToU8a(onChainMessage.reference);
+                // // Step 3b: Decode the byte array as a UTF-8 string, which will be our JSON.
+                // const referenceJson = new TextDecoder().decode(referenceBytes);
+                // Step 3c: Parse the JSON string into our ReferenceObject.
+                const referenceObj: ReferenceObject = JSON.parse(onChainMessage);
+
+                const outerJweString = await this.storageAdapter.download(referenceObj.reference).then(bytes => new TextDecoder().decode(bytes));
+
+                const calculatedDigest = await calculateSha256Digest(outerJweString);
+                if (calculatedDigest !== referenceObj.digest) {
+                    console.warn(`[Message ${messageId}] Integrity check failed! Skipping message.`);
+                    continue;
+                }
+
+                // We need to use the correct decryption function based on JWE structure
+                const jweObject = JSON.parse(outerJweString);
+                let decryptedMessageBytes: Uint8Array;
+                if (jweObject.recipients) {
+                    // It's a General JWE (like our key-sharing messages)
+                    decryptedMessageBytes = await decryptGeneralJWE(jweObject, skb);
+                } else {
+                    // It's a Compact JWE (like our direct/media messages)
+                    decryptedMessageBytes = await decryptJWE(outerJweString, skb);
+                }
+
+                const decryptedMessage = JSON.parse(new TextDecoder().decode(decryptedMessageBytes));
+
+                processedMessages.push({
+                    messageId: messageId,
+                    onChainSubmitter: onChainMessage.contributor,
+                    ...decryptedMessage
+                });
+
+            } catch (error) {
+                console.warn(`[Message ID ${key.args[1].toString()}] Failed to process message. Skipping. Error:`, error);
+                continue;
+            }
+        }
+
+        return processedMessages.sort((a, b) => a.messageId - b.messageId);
     }
 }

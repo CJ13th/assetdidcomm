@@ -6,6 +6,19 @@ import { PinataStorageAdapter } from '../../src/storage/pinata';
 import { KeyringSigner } from '../../src/signers/keyring';
 import { KiltDidResolver } from '../../src/resolvers/kilt';
 import { cryptoWaitReady } from '@polkadot/util-crypto';
+import { JWK } from 'jose';
+
+// !!! IMPORTANT !!!
+// This is the private key corresponding to the `keyAgreement` key on Charlie's DID document.
+// In a real application, this key would be securely managed by the user's wallet and
+// never exposed directly in code. We define it here ONLY for this E2E test to prove decryption.
+// You must generate this key when you create the DID for the Contributor/Charlie account.
+export const CONTRIBUTOR_PRIVATE_KEY_JWK: JWK = {
+    "kty": "OKP",
+    "crv": "X25519",
+    "x": "ao_-O0e_e2MhOwCiq2KVKzYbLETxQ__zd98UFkwgP0k",
+    "d": "DylBSNITA4q0kE3G_gPToCZ9N9kXRVMNbnQlxCdpNkM"
+};
 
 // --- Shared Configuration ---
 export const RPC_ENDPOINT = 'wss://fraa-flashbox-4654-rpc.a.stagenet.tanssi.network';
