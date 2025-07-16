@@ -1,5 +1,5 @@
 import * as jose from 'jose';
-import { setup, readState, writeState, writeKeyState, CONTRIBUTOR_DID_URI } from './_setup';
+import { setup, readState, writeState, writeKeyState, CONTRIBUTOR_DID_URI, ADMIN_PRIVATE_KEY_JWK } from './_setup';
 
 async function main() {
     const { adminClient, disconnectAll } = await setup();
@@ -20,13 +20,16 @@ async function main() {
         // This is required by the validation check in the shareBucketKey function.
         bucketPkJwk.use = 'enc';
         bucketSkJwk.use = 'enc';
+
+        const numericKeyId = Math.floor(Math.random() * 1_000_000_000_000);
+
+        bucketSkJwk.kid = numericKeyId.toString();
+        bucketPkJwk.kid = numericKeyId.toString();
         // -------------------------------------------------------------
 
         // Generate a simple numeric ID that fits in a u128.
-        const numericKeyId = Math.floor(Math.random() * 1_000_000_000_000);
 
         // Add a key ID (kid) to the public key for on-chain identification
-        bucketPkJwk.kid = `numeric-id-${numericKeyId}`;
         console.log(`🔑 Bucket Public Key (PKB) generated. On-chain ID will be: ${numericKeyId}`);
 
         // --- Step 6: Set Public Key ID on-chain ---
@@ -40,7 +43,6 @@ async function main() {
         // Note: The createTag extrinsic in your spec did not take a namespaceId, just the bucketId.
         const tagTxHash = await adminClient.createTag(state.bucketId, keySharingTag);
         console.log(`✅ Tag created successfully. Transaction Hash: ${tagTxHash}`);
-
         // --- Step 7: Share Secret Key with Contributor/Reader ---
         console.log(`\n--- [ADMIN] 4c. Sharing Secret Key with Reader (did:kilt:4p8Azs17Bod3LMHHoVWK3KHzbmKicnPpF28b96c6HYApfFu8) ---`);
 
@@ -52,7 +54,8 @@ async function main() {
             state.namespaceId,
             state.bucketId,
             { publicJwk: bucketPkJwk, secretJwk: bucketSkJwk },
-            [CONTRIBUTOR_DID_URI]
+            [CONTRIBUTOR_DID_URI],
+            ADMIN_PRIVATE_KEY_JWK
         );
         console.log(`✅ Bucket secret key shared successfully.`);
 

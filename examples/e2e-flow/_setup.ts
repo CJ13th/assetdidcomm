@@ -20,6 +20,20 @@ export const CONTRIBUTOR_PRIVATE_KEY_JWK: JWK = {
     "d": "DylBSNITA4q0kE3G_gPToCZ9N9kXRVMNbnQlxCdpNkM"
 };
 
+export const ADMIN_PRIVATE_KEY_JWK: JWK = {
+    "kty": "OKP",
+    "crv": "X25519",
+    "x": "tTszNcVxH0uqJy2SrFh5B6wmLVlMFFcueIJMARNjgGQ",
+    "d": "nYFzhYCINHVOaHXoJwiQasXpRFaW_8xm_WK053qjdmM"
+}
+
+export const MANAGER_PRIVATE_KEY_JWK: JWK = {
+    "kty": "OKP",
+    "crv": "X25519",
+    "x": "Lp3KeNaYvGxS64hMKsUmyfWwwRlf9M5LJuVvNNI-zmo",
+    "d": "K0aC-7LfmukFMbHK45i1-U7anAYDzcbfW2jPDEwhFnU"
+}
+
 // --- Shared Configuration ---
 export const RPC_ENDPOINT = 'wss://fraa-flashbox-4654-rpc.a.stagenet.tanssi.network';
 export const KILT_ENDPOINT = 'wss://peregrine.kilt.io/';
@@ -35,8 +49,7 @@ export const CONTRIBUTOR_SEED = '//Charlie';
 // In a real scenario, you would fetch these from a user's profile or identity service.
 export const MANAGER_DID = '5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY'; // Example DID for Alice
 export const ADMIN_DID = '5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty';     // Example DID for Bob
-// export const CONTRIBUTOR_DID = '5FLSigC9HGRKVhB9FiEo4Y3koPsNmBmLJbpXg2mp1hXcS59Y'; // Example DID for Charlie
-export const CONTRIBUTOR_DID = '5DGp2qAiiy7wxau9Rd2QYvMhBhttqWutznM7bqBJ8xYmnSkt'; // Example DID for Charlie
+export const CONTRIBUTOR_DID = '5FLSigC9HGRKVhB9FiEo4Y3koPsNmBmLJbpXg2mp1hXcS59Y'; // Example DID for Charlie
 export const CONTRIBUTOR_DID_URI = 'did:kilt:4p8Azs17Bod3LMHHoVWK3KHzbmKicnPpF28b96c6HYApfFu8';
 
 // --- State Management ---

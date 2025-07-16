@@ -21,10 +21,15 @@ export async function encryptJWE(
     recipientPublicKeyJwk: JWK
 ): Promise<string> {
     try {
+
+        if (!recipientPublicKeyJwk.kid) {
+            throw new Error("Recipient's public key (JWK) must have a 'kid' property.");
+        }
+
         const publicKey = await jose.importJWK(recipientPublicKeyJwk, JWE_ALG); // Specify alg for import if needed
 
         const jwe = await new jose.CompactEncrypt(plaintext)
-            .setProtectedHeader({ alg: JWE_ALG, enc: JWE_ENC })
+            .setProtectedHeader({ alg: JWE_ALG, enc: JWE_ENC, kid: recipientPublicKeyJwk.kid })
             .encrypt(publicKey);
 
         return jwe;

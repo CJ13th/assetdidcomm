@@ -162,6 +162,81 @@ export class AssetDidCommClient {
         });
     }
 
+    /**
+     * Finds the latest key-sharing message a user can decrypt and builds a map of all
+     * available keys (latest and previous) from its payload.
+     * This is an internal helper for message retrieval and key rotation workflows.
+     *
+     * @param bucketId The ID of the bucket to query.
+     * @param readerPrivateKeyJwk The user's private key for decrypting the key-sharing message.
+     * @returns A Map where the key is the SKB's public `kid` and the value is the full secret JWK.
+     * @private
+     */
+    private async _retrieveAndBuildKeyMap(
+        bucketId: number,
+        readerPrivateKeyJwk: JWK,
+    ): Promise<Map<string, JWK>> {
+        if (!this.polkadotApi) {
+            return Promise.reject(new Error("Polkadot API not initialized."));
+        }
+        console.log("--- Helper: Discovering all accessible secret keys... ---");
+        const messageEntries = await this.polkadotApi.query.buckets.messages.entries(bucketId);
+
+        // Filter for only key-sharing messages and sort them newest-first.
+        const keySharingMessages = messageEntries
+            .map(([key, value]) => ({
+                id: (key.args[1] as any).toNumber(),
+                onChainData: value.toPrimitive() as any
+            }))
+            .filter(msg => msg.onChainData?.tag === 'didcomm/key-sharing-v1')
+            .sort((a, b) => b.id - a.id); // Sort descending
+
+        if (keySharingMessages.length === 0) {
+            throw new Error("No key-sharing messages found in the bucket.");
+        }
+
+        // Iterate through the key-sharing messages from newest to oldest.
+        // The first one we can decrypt is the one we use.
+        for (const message of keySharingMessages) {
+            try {
+                const referenceObj: ReferenceObject = JSON.parse(message.onChainData.reference);
+                const jweString = await this.storageAdapter.download(referenceObj.reference).then(bytes => new TextDecoder().decode(bytes));
+
+                // Verify integrity before attempting to decrypt
+                const calculatedDigest = await calculateSha256Digest(jweString);
+                if (calculatedDigest !== referenceObj.digest) {
+                    console.warn(`[Key Discovery] Integrity check failed for key-sharing message #${message.id}. Skipping.`);
+                    continue;
+                }
+
+                // Attempt to decrypt with the user's main private key.
+                const decryptedBytes = await decryptGeneralJWE(JSON.parse(jweString), readerPrivateKeyJwk);
+                const decryptedMsg = JSON.parse(new TextDecoder().decode(decryptedBytes));
+
+                // If decryption succeeds, we've found our source of truth. Build the map and return.
+                console.log(`   [Key Discovery] Successfully decrypted key-sharing message #${message.id}. Building key map.`);
+                const availableSkbs = new Map<string, JWK>();
+                for (const keyInfo of decryptedMsg.body.keys) {
+                    // Reconstruct the full secret key from the message payload.
+                    const skbJwk = { ...keyInfo, d: keyInfo.d, use: 'enc' };
+                    if (skbJwk.kid) {
+                        availableSkbs.set(skbJwk.kid, skbJwk);
+                    }
+                }
+                console.log('availableSkbs', availableSkbs)
+                return availableSkbs;
+
+            } catch (e) {
+                // This is an expected failure if the user was not a recipient of this message.
+                console.log(`   [Key Discovery] Could not decrypt key-sharing message #${message.id}. Trying next one.`);
+                continue;
+            }
+        }
+
+        // If the loop finishes and we haven't returned, the user has no valid keys.
+        throw new Error("Decryption failed for all key-sharing messages. User does not have access.");
+    }
+
 
 
     /**
@@ -501,30 +576,70 @@ export class AssetDidCommClient {
     }
 
     /**
-     * Creates and distributes a bucket's secret key (SKB) to a list of readers.
+     * Creates and distributes a bucket's secret keys (SKB) to a list of readers.
      * This function correctly parses a standard W3C KILT DID Document to find and
      * convert the keyAgreement key for encryption.
      */
     public async shareBucketKey(
         entityId: number,
         bucketId: number,
-        bucketKeys: { publicJwk: JWK; secretJwk: JWK },
-        readerDids: Did[] | string[]
+        newBucketKeys: { publicJwk: JWK; secretJwk: JWK },
+        readerDids: Did[] | string[],
+        adminPrivateKeyJwk: JWK
     ): Promise<{ messageIdOnChain: string; storageIdentifier: string }> {
         console.log(`Sharing bucket key for bucket ${bucketId} with ${readerDids.length} readers.`);
 
-        // 1. Prepare the key-sharing DIDComm message (this part is correct)
-        const skbForWasm = bucketKeys.secretJwk;
-        if (!skbForWasm.kty || !skbForWasm.crv || !skbForWasm.x || !skbForWasm.use) {
-            throw new Error("The provided secret JWK is missing required properties.");
+        // 1. Fetch all existing keys that the current admin has access to.
+        let allKeysToShare: JWK[] = [];
+        try {
+            const existingKeyMap = await this._retrieveAndBuildKeyMap(bucketId, adminPrivateKeyJwk);
+            console.log(`Found ${existingKeyMap.size} existing key(s) to include for history.`);
+            // We only need the secret key part for the payload.
+            allKeysToShare = Array.from(existingKeyMap.values());
+        } catch (error) {
+            console.log("No previous key-sharing messages found or accessible. This will be the first one.");
         }
-        const wasmCompatibleKey = { kty: skbForWasm.kty, crv: skbForWasm.crv, x: skbForWasm.x, d: '', y: '', use: skbForWasm.use, kid: skbForWasm.kid || `skb-for-bucket-${bucketId}` };
-        const keySharingMsgString = createKeySharingMessage({ id: uuidv4(), from: this.config.signer.getAddress(), to: readerDids, keys: [wasmCompatibleKey] });
+
+
+        // 2. Prepare the keys for the WASM module
+        const wasmCompatibleKeys = allKeysToShare.map(skb => {
+            if (!skb.kty || !skb.crv || !skb.x || !skb.d || !skb.use || !skb.kid) {
+                throw new Error("The new secret JWK is missing required properties, including 'kid'.");
+            }
+
+            return {
+                kty: skb.kty,
+                crv: skb.crv,
+                x: skb.x,
+                d: skb.d,
+                y: '', // Workaround for rigid WASM interface.
+                use: skb.use,
+                kid: skb.kid,
+            }
+
+        })
+
+        // 3. Add the new "latest" key to the list.
+        const latestSkb = newBucketKeys.secretJwk;
+        if (!latestSkb.kty || !latestSkb.crv || !latestSkb.x || !latestSkb.d || !latestSkb.use || !latestSkb.kid) {
+            throw new Error("The new secret JWK is missing required properties, including 'kid'.");
+        }
+        wasmCompatibleKeys.push({
+            kty: latestSkb.kty,
+            crv: latestSkb.crv,
+            x: latestSkb.x,
+            d: latestSkb.d,
+            y: '', // Workaround for rigid WASM interface.
+            use: latestSkb.use,
+            kid: latestSkb.kid,
+        });
+
+        const keySharingMsgString = createKeySharingMessage({ id: uuidv4(), from: this.config.signer.getAddress(), to: readerDids, keys: wasmCompatibleKeys });
         const plaintextBytes = new TextEncoder().encode(keySharingMsgString);
         console.log("Constructed Key-Sharing Message:", JSON.parse(keySharingMsgString));
 
         // 2. Resolve Reader DIDs and construct their JWKs
-        const recipientKeys: JWK[] = [bucketKeys.publicJwk];
+        const recipientKeys: JWK[] = [newBucketKeys.publicJwk];
         for (const did of readerDids) {
             console.log(`Resolving DID for reader: ${did} `);
             const resolutionResult = await this.config.didResolver.resolve(did as Did);
@@ -535,7 +650,6 @@ export class AssetDidCommClient {
                 continue;
             }
 
-            // --- FINAL, CORRECT PARSING LOGIC ---
             // 1. Get the key reference URI from the keyAgreement section.
             const keyAgreementRef = didDocument.keyAgreement[0];
 
@@ -665,6 +779,65 @@ export class AssetDidCommClient {
         const skb = decryptedMsg.body.keys[0]; // Assuming the first key is the SKB
 
         return skb;
+    }
+
+    /**
+     * Retrieves all available secret bucket keys (latest and previous) for a user.
+     * It finds the latest key-sharing message and decrypts it with the user's private key.
+     * @param bucketId The ID of the bucket.
+     * @param readerPrivateKeyJwk The user's private key for decryption.
+     * @returns An object containing the latest SKB and a map of all available SKBs by their public key ID (kid).
+     */
+    public async retrieveBucketKeys(
+        bucketId: number,
+        readerPrivateKeyJwk: JWK,
+    ): Promise<{ latestSkb: JWK; allSkbsByKid: Map<string, JWK> }> {
+        if (!this.polkadotApi) throw new Error("Polkadot API not initialized.");
+
+        const messageEntries = await this.polkadotApi.query.buckets.messages.entries(bucketId);
+        const keySharingMessages = messageEntries
+            .map(([key, value]) => ({
+                ...(value.toPrimitive() as any),
+                id: (key.args[1] as any).toNumber(),
+            }))
+            .filter(msg => msg.tag === 'didcomm/key-sharing-v1');
+
+        if (keySharingMessages.length === 0) throw new Error(`No key-sharing message found in bucket ${bucketId}.`);
+        const keyMessageInfo = keySharingMessages.sort((a, b) => b.id - a.id)[0];
+
+        const referenceObj: ReferenceObject = JSON.parse(keyMessageInfo.reference);
+        const jweString = await this.storageAdapter.download(referenceObj.reference).then(bytes => new TextDecoder().decode(bytes));
+        const calculatedDigest = await calculateSha256Digest(jweString);
+        if (calculatedDigest !== referenceObj.digest) throw new Error('Integrity check failed for key-sharing message.');
+
+        const decryptedBytes = await decryptGeneralJWE(JSON.parse(jweString), readerPrivateKeyJwk);
+        const decryptedMsg = JSON.parse(new TextDecoder().decode(decryptedBytes));
+
+        // Now, process the keys from the message body
+        if (!decryptedMsg.body.keys || decryptedMsg.body.keys.length === 0) {
+            throw new Error("Decrypted key-sharing message has no keys.");
+        }
+
+        const allSkbsByKid = new Map<string, JWK>();
+        let latestSkb: JWK | null = null;
+
+        for (const key of decryptedMsg.body.keys) {
+            const fullKid = key.kid || '';
+            const [status, kid] = fullKid.split(':');
+
+            // Reconstruct the full secret key from the message.
+            // Note: The 'd' parameter is what makes it a secret key.
+            const skbJwk = { ...key, d: key.d, use: 'enc', kid: kid };
+
+            if (status === 'latest' && !latestSkb) {
+                latestSkb = skbJwk;
+            }
+            allSkbsByKid.set(kid, skbJwk);
+        }
+
+        if (!latestSkb) throw new Error("Could not determine the latest SKB from the key-sharing message.");
+
+        return { latestSkb, allSkbsByKid };
     }
 
     // --- Roles and Permissions Management ---
@@ -1079,15 +1252,8 @@ export class AssetDidCommClient {
         return { messageIdOnChain: txHash, mediaCid: mediaCid };
     }
 
-
-
     /**
-     * Retrieves all messages from a bucket, decrypts them, and returns them in a structured format.
-     * This is the primary method for fetching a "feed" for a bucket.
-     *
-     * @param bucketId The ID of the bucket to fetch messages from.
-     * @param readerPrivateKeyJwk The private key of the user fetching the messages, used for decryption.
-     * @returns A promise that resolves to an array of processed messages.
+     * Retrieves and decrypts the full message history, providing placeholders for undecryptable messages.
      */
     public async retrieveBucketMessages(
         bucketId: number,
@@ -1095,79 +1261,118 @@ export class AssetDidCommClient {
     ): Promise<any[]> {
         if (!this.polkadotApi) throw new Error("Polkadot API not initialized.");
 
-        console.log(`\n--- Retrieving all messages for bucket ${bucketId} ---`);
+        const availableSkbs = await this._retrieveAndBuildKeyMap(bucketId, readerPrivateKeyJwk);
+        console.log(`\n--- Decrypting content with ${availableSkbs.size} available key(s)... ---`);
 
         const messageEntries = await this.polkadotApi.query.buckets.messages.entries(bucketId);
-
-        if (messageEntries.length === 0) {
-            console.log("No messages found in this bucket.");
-            return [];
-        }
-
-        console.log(`Found ${messageEntries.length} raw message entries. Processing...`);
-
-        const skb = await this.retrieveBucketSecretKey(bucketId, readerPrivateKeyJwk);
-        if (!skb) {
-            throw new Error(`Could not retrieve the Secret Bucket Key for bucket ${bucketId}. Cannot decrypt messages.`);
-        }
-
-        const processedMessages: DecryptedMessage[] = [];
+        const processedMessages: any[] = [];
 
         for (const [key, value] of messageEntries) {
+            const messageId = (key.args[1] as any).toNumber();
+            const onChainMessage = value.toPrimitive() as any;
+
+            // We don't display key-sharing messages in the feed.
+            if (onChainMessage?.tag === 'didcomm/key-sharing-v1') continue;
+
+            let messagePayload: any = {
+                messageId: messageId,
+                onChainSubmitter: onChainMessage.contributor,
+                error: null,
+            };
+
             try {
-                const messageId = (key.args[1] as any).toNumber();
-                // The .toPrimitive() method conveniently converts pallet types to JS types.
-                // The actual message data is nested inside the Option<Message> struct.
-                console.log(value.toPrimitive());
+                if (!onChainMessage?.reference) throw new Error("On-chain data is invalid.");
 
-                const onChainMessage = (value.toPrimitive() as any).reference;
-                console.log(onChainMessage);
-                if (!onChainMessage) {
-                    console.warn(`[Message ${messageId}] Message data is empty. Skipping.`);
-                    continue;
+                const referenceObj: ReferenceObject = JSON.parse(onChainMessage.reference);
+                const outerJweContent = await this.storageAdapter.download(referenceObj.reference).then(bytes => new TextDecoder().decode(bytes));
+
+                const calculatedDigest = await calculateSha256Digest(outerJweContent);
+                if (calculatedDigest !== referenceObj.digest) throw new Error("Integrity check failed! Content may have been tampered with.");
+
+                console.log("outerJweContent", outerJweContent)
+
+                const protectedHeaderB64 = outerJweContent.split('.')[0];
+                console.log("\nprotectedHeaderB64", protectedHeaderB64)
+                const protectedHeader = JSON.parse(new TextDecoder().decode(Buffer.from(protectedHeaderB64, 'base64url')));
+                console.log("\protectedHeader", protectedHeader)
+                const kidNeeded = protectedHeader.kid;
+
+
+                if (!kidNeeded) throw new Error("Cannot decrypt: message is missing 'kid' in header.");
+
+                const decryptionKey = availableSkbs.get(kidNeeded);
+                if (!decryptionKey) {
+                    throw new Error(`Permission denied: You do not have the required key (kid: ${kidNeeded}).`);
                 }
 
-                // // 3. Decode the ReferenceObject from its on-chain hex format.
-                // // Step 3a: Convert the 0x-prefixed hex string to a byte array (Uint8Array).
-                // const referenceBytes = hexToU8a(onChainMessage.reference);
-                // // Step 3b: Decode the byte array as a UTF-8 string, which will be our JSON.
-                // const referenceJson = new TextDecoder().decode(referenceBytes);
-                // Step 3c: Parse the JSON string into our ReferenceObject.
-                const referenceObj: ReferenceObject = JSON.parse(onChainMessage);
-
-                const outerJweString = await this.storageAdapter.download(referenceObj.reference).then(bytes => new TextDecoder().decode(bytes));
-
-                const calculatedDigest = await calculateSha256Digest(outerJweString);
-                if (calculatedDigest !== referenceObj.digest) {
-                    console.warn(`[Message ${messageId}] Integrity check failed! Skipping message.`);
-                    continue;
-                }
-
-                // We need to use the correct decryption function based on JWE structure
-                const jweObject = JSON.parse(outerJweString);
-                let decryptedMessageBytes: Uint8Array;
-                if (jweObject.recipients) {
-                    // It's a General JWE (like our key-sharing messages)
-                    decryptedMessageBytes = await decryptGeneralJWE(jweObject, skb);
-                } else {
-                    // It's a Compact JWE (like our direct/media messages)
-                    decryptedMessageBytes = await decryptJWE(outerJweString, skb);
-                }
-
+                const decryptedMessageBytes = await decryptJWE(outerJweContent, decryptionKey);
                 const decryptedMessage = JSON.parse(new TextDecoder().decode(decryptedMessageBytes));
 
-                processedMessages.push({
-                    messageId: messageId,
-                    onChainSubmitter: onChainMessage.contributor,
-                    ...decryptedMessage
-                });
+                // Merge the successfully decrypted payload
+                messagePayload = { ...messagePayload, ...decryptedMessage };
 
-            } catch (error) {
-                console.warn(`[Message ID ${key.args[1].toString()}] Failed to process message. Skipping. Error:`, error);
-                continue;
+                if (messagePayload.type.includes('media-sharing') && messagePayload.attachments) {
+                    for (const attachment of messagePayload.attachments) {
+                        const item = messagePayload.body.items.find((i: any) => i.attachment_id === attachment.id);
+                        if (item?.ciphering && attachment.data?.links) {
+                            // Attach the decryptor function directly to the object!
+                            attachment.decryptFile = async (): Promise<Uint8Array> => {
+                                // This inner function uses the variables from the outer scope
+                                return this._decryptReferencedFile(item, attachment, availableSkbs);
+                            };
+                        }
+                    }
+                }
+
+            } catch (error: any) {
+                // If any step in the try block fails, we catch it and set the error property.
+                console.warn(`[Message ID ${messageId}] Failed to process. Creating placeholder. Reason:`, error.message);
+                messagePayload.error = error.message;
             }
+
+            // Add the message to the feed, whether it succeeded or failed.
+            processedMessages.push(messagePayload);
         }
 
         return processedMessages.sort((a, b) => a.messageId - b.messageId);
+    }
+
+    /**
+     * Internal helper to perform the two-layer decryption of a referenced media file.
+     * @private
+     */
+    private async _decryptReferencedFile(
+        item: MediaItemReferenced,
+        attachment: any, // In production, this would be a specific attachment type
+        availableSkbs: Map<string, JWK>
+    ): Promise<Uint8Array> {
+        if (!item.ciphering?.parameters) throw new Error("Ciphering parameters are missing.");
+
+        const encryptedMediaCekJwe = item.ciphering.parameters.key as string;
+        const ivHex = item.ciphering.parameters.iv as string;
+        const cid = attachment.data.links[0].replace('ipfs://', '');
+        const expectedHash = attachment.data.hash.replace('sha2-256:', '');
+
+        const cekHeader = JSON.parse(new TextDecoder().decode(Buffer.from(encryptedMediaCekJwe.split('.')[0], 'base64url')));
+        const kidNeeded = cekHeader.kid;
+        if (!kidNeeded) throw new Error("File key JWE is missing 'kid'.");
+
+        const skb = availableSkbs.get(kidNeeded);
+        if (!skb) throw new Error(`User lacks required key (kid: ${kidNeeded}) to decrypt file key.`);
+
+        const rawMediaCekBytes = await decryptJWE(encryptedMediaCekJwe, skb);
+        const mediaCEK = await crypto.subtle.importKey('raw', rawMediaCekBytes, { name: 'AES-GCM' }, true, ['decrypt']);
+
+        const encryptedFileBytes = await this.storageAdapter.download(cid);
+        const ivBytes = hexToU8a(ivHex);
+
+        const decryptedFileBytes = new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: ivBytes }, mediaCEK, encryptedFileBytes));
+
+        const calculatedHash = await calculateSha256Digest(decryptedFileBytes);
+        if (calculatedHash !== expectedHash) {
+            throw new Error("File integrity check failed!");
+        }
+
+        return decryptedFileBytes;
     }
 }
