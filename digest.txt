@@ -1,0 +1,601 @@
+Directory structure:
+└── e2e-flow/
+    ├── 01-create-namespace.ts
+    ├── 02-create-bucket.ts
+    ├── 03-assign-roles.ts
+    ├── 04-setup-bucket-keys.ts
+    ├── 05-send-messages.ts
+    ├── 06-fetch-all-messages.ts
+    ├── _setup.ts
+    ├── e2e-keys.json
+    └── e2e-state.json
+
+
+Files Content:
+
+============================================================
+FILE: 01-create-namespace.ts
+============================================================
+import { setup, writeState } from './_setup';
+
+async function main() {
+    const { managerClient, disconnectAll } = await setup();
+
+    try {
+        // --- Step 1: Create a new Namespace ---
+        // A unique ID for the entity/namespace
+        const namespaceId = Math.floor(Math.random() * 1_000_000_000);
+
+        console.log(`\n--- [MANAGER] 1. Creating Namespace: ${namespaceId} ---`);
+        const txHash = await managerClient.createEntity(namespaceId, { name: "E2E Test Asset" });
+        console.log(`✅ Namespace created successfully! Transaction Hash: ${txHash}`);
+
+        // Write the new namespaceId to our shared state file for the next script to use
+        writeState({ namespaceId });
+
+    } catch (error) {
+        console.error("\n❌ Error in Step 1: Create Namespace", error);
+        process.exit(1);
+    } finally {
+        await disconnectAll();
+    }
+}
+
+main().catch(console.error);
+
+
+============================================================
+FILE: 02-create-bucket.ts
+============================================================
+import { setup, readState, writeState } from './_setup';
+
+async function main() {
+    const { managerClient, disconnectAll } = await setup();
+    const state = readState();
+
+    if (!state.namespaceId) {
+        throw new Error("Namespace ID not found in e2e-state.json. Please run 01-create-namespace.ts first.");
+    }
+
+    try {
+        // --- Step 2: Create a Bucket in the Namespace ---
+        console.log(`\n--- [MANAGER] 2. Creating Bucket in Namespace: ${state.namespaceId} ---`);
+        const { bucketId, txHash } = await managerClient.createBucket(state.namespaceId, { purpose: "Document Storage" });
+        console.log(`✅ Bucket created successfully with ID: ${bucketId}. Transaction Hash: ${txHash}`);
+
+        // Write the new bucketId to our state file
+        writeState({ bucketId });
+
+    } catch (error) {
+        console.error("\n❌ Error in Step 2: Create Bucket", error);
+        process.exit(1);
+    } finally {
+        await disconnectAll();
+    }
+}
+
+main().catch(console.error);
+
+
+============================================================
+FILE: 03-assign-roles.ts
+============================================================
+import { setup, readState, ADMIN_DID, CONTRIBUTOR_DID, MANAGER_DID } from './_setup';
+
+async function main() {
+    // We need both manager and admin clients for this step
+    const { managerClient, adminClient, disconnectAll } = await setup();
+    const state = readState();
+
+    if (!state.namespaceId || state.bucketId === undefined) {
+        throw new Error("Namespace/Bucket ID not found in e2e-state.json. Please run previous scripts first.");
+    }
+
+    try {
+        // --- Step 3: Assign Admin by Manager ---
+        console.log(`\n--- [MANAGER] 3a. Assigning Admin (${ADMIN_DID}) to Bucket ${state.bucketId} ---`);
+        const adminTxHash = await managerClient.addAdmin(state.namespaceId, state.bucketId, ADMIN_DID);
+        console.log(`✅ Admin assigned successfully. Transaction Hash: ${adminTxHash}`);
+
+        // --- Step 4: Assign Contributor by Admin ---
+        console.log(`\n--- [ADMIN] 3b. Assigning Contributor (${CONTRIBUTOR_DID}) to Bucket ${state.bucketId} ---`);
+        const contributorTxHash = await adminClient.addContributor(state.namespaceId, state.bucketId, CONTRIBUTOR_DID);
+        console.log(`✅ Contributor assigned successfully. Transaction Hash: ${contributorTxHash}`);
+
+        // --- Step 5: Assign Contributor by Admin ---
+        console.log(`\n--- [ADMIN] 3c.  Admin grants self Contributor role - Assigning Contributor (${ADMIN_DID}) to Bucket ${state.bucketId} ---`);
+        const adminAsContributorTxHash = await adminClient.addContributor(state.namespaceId, state.bucketId, ADMIN_DID);
+        console.log(`✅ Admin assigned as Contributor successfully. Transaction Hash: ${adminAsContributorTxHash}`);
+
+        // --- Step 6: Assign Contributor by Admin ---
+        console.log(`\n--- [ADMIN] 3d.  Admin grants the Manager Contributor role - Assigning Contributor (${MANAGER_DID}) to Bucket ${state.bucketId} ---`);
+        const managerAsContributorTxHash = await adminClient.addContributor(state.namespaceId, state.bucketId, MANAGER_DID);
+        console.log(`✅ Manager assigned as Contributor successfully. Transaction Hash: ${managerAsContributorTxHash}`);
+
+    } catch (error) {
+        console.error("\n❌ Error in Step 3: Assign Roles", error);
+        process.exit(1);
+    } finally {
+        await disconnectAll();
+    }
+}
+
+main().catch(console.error);
+
+
+============================================================
+FILE: 04-setup-bucket-keys.ts
+============================================================
+import * as jose from 'jose';
+import { setup, readState, writeState, writeKeyState, CONTRIBUTOR_DID_URI, ADMIN_PRIVATE_KEY_JWK } from './_setup';
+
+async function main() {
+    const { adminClient, disconnectAll } = await setup();
+    const state = readState();
+
+    if (!state.namespaceId || state.bucketId === undefined) {
+        throw new Error("Namespace/Bucket ID not found in e2e-state.json. Please run previous scripts first.");
+    }
+
+    try {
+        // --- Step 5: Generate Bucket Keys (off-chain) ---
+        console.log(`\n--- [ADMIN] 4a. Generating Bucket Keys ---`);
+        const { publicKey, privateKey } = await jose.generateKeyPair('ECDH-ES+A256KW', { crv: 'X25519', extractable: true });
+        const bucketPkJwk = await jose.exportJWK(publicKey);
+        const bucketSkJwk = await jose.exportJWK(privateKey);
+
+
+        // This is required by the validation check in the shareBucketKey function.
+        bucketPkJwk.use = 'enc';
+        bucketSkJwk.use = 'enc';
+
+        const numericKeyId = Math.floor(Math.random() * 1_000_000_000_000);
+
+        bucketSkJwk.kid = numericKeyId.toString();
+        bucketPkJwk.kid = numericKeyId.toString();
+        // -------------------------------------------------------------
+
+        // Generate a simple numeric ID that fits in a u128.
+
+        // Add a key ID (kid) to the public key for on-chain identification
+        console.log(`🔑 Bucket Public Key (PKB) generated. On-chain ID will be: ${numericKeyId}`);
+
+        // --- Step 6: Set Public Key ID on-chain ---
+        console.log(`\n--- [ADMIN] 4b. Setting Bucket Public Key ID on-chain ---`);
+        const setKeyTxHash = await adminClient.setBucketPublicKey(state.namespaceId, state.bucketId, numericKeyId);
+        console.log(`✅ Bucket public key ID set successfully. Transaction Hash: ${setKeyTxHash}`);
+
+        // Create the tag required for the key-sharing message ---
+        const keySharingTag = 'didcomm/key-sharing-v1';
+        console.log(`\n--- [ADMIN] 4c. Creating Tag "${keySharingTag}" for Bucket ${state.bucketId} ---`);
+        // Note: The createTag extrinsic in your spec did not take a namespaceId, just the bucketId.
+        const tagTxHash = await adminClient.createTag(state.bucketId, keySharingTag);
+        console.log(`✅ Tag created successfully. Transaction Hash: ${tagTxHash}`);
+        // --- Step 7: Share Secret Key with Contributor/Reader ---
+        console.log(`\n--- [ADMIN] 4c. Sharing Secret Key with Reader (did:kilt:4p8Azs17Bod3LMHHoVWK3KHzbmKicnPpF28b96c6HYApfFu8) ---`);
+
+        // Store the key in our off-chain key file BEFORE trying to share it,
+        // so the `shareBucketKey` function can resolve it via `fetchBucketPublicKey`.
+        writeKeyState({ [numericKeyId]: bucketPkJwk });
+
+        await adminClient.shareBucketKey(
+            state.namespaceId,
+            state.bucketId,
+            { publicJwk: bucketPkJwk, secretJwk: bucketSkJwk },
+            [CONTRIBUTOR_DID_URI],
+            ADMIN_PRIVATE_KEY_JWK
+        );
+        console.log(`✅ Bucket secret key shared successfully.`);
+
+        // Save the full keys to the main state file for the verification step.
+        writeState({ bucketPkJwk, bucketSkJwk });
+
+    } catch (error) {
+        console.error("\n❌ Error in Step 4: Setup Bucket Keys", error);
+        process.exit(1);
+    } finally {
+        await disconnectAll();
+    }
+}
+
+main().catch(console.error);
+
+
+============================================================
+FILE: 05-send-messages.ts
+============================================================
+import { setup, readState, CONTRIBUTOR_PRIVATE_KEY_JWK } from './_setup';
+
+async function main() {
+    // We need clients for the Manager (Alice), Admin (Bob), and Contributor (Charlie)
+    const { managerClient, adminClient, contributorClient, disconnectAll } = await setup();
+    const state = readState();
+
+    if (!state.namespaceId || state.bucketId === undefined) {
+        throw new Error("State not found. Please run scripts 01-04 first.");
+    }
+
+    // For this test, Charlie will be the one fetching the feed at the end.
+    const readerClient = contributorClient;
+
+    try {
+
+        // --- STEP 1: Alice (Manager) sends a welcome message ---
+        console.log("\n--- [ALICE] Sending first message ---");
+        await managerClient.sendDirectMessage(
+            state.namespaceId,
+            state.bucketId,
+            `bucket:${state.bucketId}`, // Target the bucket itself
+            "Welcome to the project bucket everyone!"
+        );
+        console.log("Alice's message sent.");
+
+
+        // --- STEP 2: Bob (Admin) sends a status update ---
+        console.log("\n--- [BOB] Sending second message ---");
+        await adminClient.sendDirectMessage(
+            state.namespaceId,
+            state.bucketId,
+            `bucket:${state.bucketId}`,
+            "I have set up the initial permissions. Please start uploading your documents."
+        );
+        console.log("Bob's message sent.");
+
+        const mediaSharingTag = 'didcomm/media-sharing-v1';
+        console.log(`\n--- [ADMIN] Creating Tag "${mediaSharingTag}" for Bucket ${state.bucketId} ---`);
+        const mediaTagTxHash = await adminClient.createTag(state.bucketId, mediaSharingTag);
+        console.log(`✅ Tag created successfully. Transaction Hash: ${mediaTagTxHash}`);
+
+
+
+        // --- STEP 3: Charlie (Contributor) sends a media file ---
+        console.log("\n--- [CHARLIE] Sending a media message ---");
+        const reportContent = `This is the second weekly report. All systems are broken!`;
+        const reportBytes = new TextEncoder().encode(reportContent);
+        await contributorClient.sendMediaMessage(
+            state.namespaceId,
+            state.bucketId,
+            {
+                content: reportBytes,
+                mediaType: 'text/plain',
+                fileName: 'weekly-report-2.txt',
+            }
+        );
+        console.log("Charlie's media message sent.");
+
+    } catch (error) {
+        console.error("\n❌ Error in sending messages:", error);
+        process.exit(1);
+    } finally {
+        await disconnectAll();
+    }
+}
+
+main().catch(console.error);
+
+
+============================================================
+FILE: 06-fetch-all-messages.ts
+============================================================
+import { MediaItem } from 'message-module-js';
+import { setup, readState, CONTRIBUTOR_PRIVATE_KEY_JWK } from './_setup';
+
+/**
+ * A helper function to process a decrypted DIDComm message and extract its content
+ * in a user-friendly format, correctly parsing the two-part media-sharing structure.
+ * @param msg The decrypted message object from retrieveBucketMessages.
+ * @returns A string representing the displayable content of the message.
+ */
+function processMessageContent(msg: any): string {
+    if (msg.type.includes('basicmessage')) {
+        return `[Text] "${msg.body.content}"`;
+    }
+
+    if (msg.type.includes('media-sharing')) {
+        console.log('MESSAGE FULL', JSON.stringify(msg, null, 2));
+        // The 'attachments' array holds the data, the 'body.items' array holds the metadata.
+        if (!msg.attachments || !msg.body?.items) {
+            return '[Malformed Media-Sharing Message: Missing attachments or body.items]';
+        }
+
+        const processedAttachments = msg.body.items.map((item: any) => {
+            // 1. Get the ID that links the body item to the full attachment.
+            const attachmentId = item.attachment_id;
+            if (!attachmentId) return '[Attachment metadata item is missing an attachment_id]';
+
+            // 2. Find the full attachment data using this ID.
+            const fullAttachment = msg.attachments.find((att: any) => att.id === attachmentId);
+            if (!fullAttachment) return `[Attachment data not found for id: ${attachmentId}]`;
+
+            const fileName = fullAttachment.fileName || 'untitled';
+
+            // 3. Now, check inside the attachment's 'data' property for the content.
+            if (fullAttachment.data?.base64) {
+                try {
+                    const decodedContent = Buffer.from(fullAttachment.data.base64, 'base64').toString('utf-8');
+                    return `[Inlined Attachment: ${fileName}]\n      "${decodedContent}"`;
+                } catch (e) {
+                    return `[Inlined Attachment: Error decoding Base64 content]`;
+                }
+            } else if (fullAttachment.data?.links && fullAttachment.data.links.length > 0) {
+                // This handles referenced media correctly.
+                const link = fullAttachment.data.links[0];
+                return `[Referenced Attachment: ${fileName}]\n      Link: ${link}\n      (Full decryption of referenced file would happen here)`;
+            }
+
+            return `[Unknown data format in attachment ID: ${attachmentId}]`;
+        });
+
+        return processedAttachments.join('\n\n      ');
+    }
+
+    return '[Unknown Message Type]';
+}
+
+async function main() {
+    // We need clients for the Manager (Alice), Admin (Bob), and Contributor (Charlie)
+    const { managerClient, adminClient, contributorClient, disconnectAll } = await setup();
+    const state = readState();
+
+    if (!state.namespaceId || state.bucketId === undefined) {
+        throw new Error("State not found. Please run scripts 01-04 first.");
+    }
+
+    // For this test, Charlie will be the one fetching the feed at the end.
+    const readerClient = contributorClient;
+
+    try {
+        // --- : Charlie retrieves and displays the entire feed ---
+        const messageFeed = await readerClient.retrieveBucketMessages(state.bucketId, CONTRIBUTOR_PRIVATE_KEY_JWK);
+
+        console.log("\n\n" + "=".repeat(80));
+        console.log(`✅✅✅ BUCKET FEED SUCCESSFULLY RETRIEVED (${messageFeed.length} messages) ✅✅✅`);
+        console.log("=".repeat(80));
+
+        for (const msg of messageFeed) {
+            console.log(`\n[Message #${msg.messageId}] from ${msg.from}---------------------`);
+
+            if (msg.error) {
+                console.log(`  Content: [Cannot be processed: ${msg.error}]`);
+                continue;
+            }
+
+            if (msg.type.includes('basicmessage')) {
+                console.log(`  Content: "${msg.body.content}"`);
+            }
+            else if (msg.type.includes('media-sharing') && msg.attachments) {
+                for (const attachment of msg.attachments) {
+                    // Check if our helper attached the decryptor function
+                    if (typeof attachment.decryptFile === 'function') {
+                        console.log(`  Attachment (Referenced): ${attachment.filename}`);
+                        try {
+                            // Call the on-demand decryptor!
+                            const fileBytes = await attachment.decryptFile();
+                            const fileContent = new TextDecoder().decode(fileBytes);
+                            console.log("  ---------------- DECRYPTED CONTENT ----------------");
+                            console.log(`  ${fileContent}`);
+                            console.log("  -------------------------------------------------");
+                        } catch (e: any) {
+                            console.log(`  Could not decrypt file: ${e.message}`);
+                        }
+                    } else if (attachment.data?.base64) {
+                        // Handle inlined files
+                        const decodedContent = Buffer.from(attachment.data.base64, 'base64').toString('utf-8');
+                        console.log(`  Attachment (Inlined): ${attachment.description}`);
+                        console.log(`  Content: "${decodedContent}"`);
+                    }
+                }
+            }
+        }
+        console.log("\n" + "=".repeat(80));
+
+
+    } catch (error) {
+        console.error("\n❌ Error in sending messages: send messages", error);
+        process.exit(1);
+    } finally {
+        await disconnectAll();
+    }
+}
+
+main().catch(console.error);
+
+
+============================================================
+FILE: _setup.ts
+============================================================
+import 'dotenv/config';
+import * as fs from 'fs';
+import * as path from 'path';
+import { AssetDidCommClient } from '../../src/client';
+import { PinataStorageAdapter } from '../../src/storage/pinata';
+import { KeyringSigner } from '../../src/signers/keyring';
+import { KiltDidResolver } from '../../src/resolvers/kilt';
+import { cryptoWaitReady } from '@polkadot/util-crypto';
+import { JWK } from 'jose';
+
+// !!! IMPORTANT !!!
+// This is the private key corresponding to the `keyAgreement` key on Charlie's DID document.
+// In a real application, this key would be securely managed by the user's wallet and
+// never exposed directly in code. We define it here ONLY for this E2E test to prove decryption.
+// You must generate this key when you create the DID for the Contributor/Charlie account.
+export const CONTRIBUTOR_PRIVATE_KEY_JWK: JWK = {
+    "kty": "OKP",
+    "crv": "X25519",
+    "x": "ao_-O0e_e2MhOwCiq2KVKzYbLETxQ__zd98UFkwgP0k",
+    "d": "DylBSNITA4q0kE3G_gPToCZ9N9kXRVMNbnQlxCdpNkM"
+};
+
+export const ADMIN_PRIVATE_KEY_JWK: JWK = {
+    "kty": "OKP",
+    "crv": "X25519",
+    "x": "tTszNcVxH0uqJy2SrFh5B6wmLVlMFFcueIJMARNjgGQ",
+    "d": "nYFzhYCINHVOaHXoJwiQasXpRFaW_8xm_WK053qjdmM"
+}
+
+export const MANAGER_PRIVATE_KEY_JWK: JWK = {
+    "kty": "OKP",
+    "crv": "X25519",
+    "x": "Lp3KeNaYvGxS64hMKsUmyfWwwRlf9M5LJuVvNNI-zmo",
+    "d": "K0aC-7LfmukFMbHK45i1-U7anAYDzcbfW2jPDEwhFnU"
+}
+
+// --- Shared Configuration ---
+export const RPC_ENDPOINT = 'wss://fraa-flashbox-4654-rpc.a.stagenet.tanssi.network';
+export const KILT_ENDPOINT = 'wss://peregrine.kilt.io/';
+const PINATA_JWT = process.env.PINATA_JWT;
+const PINATA_GATEWAY = process.env.PINATA_GATEWAY;
+
+// --- Well-known Accounts & DIDs ---
+export const MANAGER_SEED = '//Alice';
+export const ADMIN_SEED = '//Bob';
+export const CONTRIBUTOR_SEED = '//Charlie';
+
+// These DIDs must correspond to the seeds above and have a keyAgreement key.
+// In a real scenario, you would fetch these from a user's profile or identity service.
+export const MANAGER_DID = '5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY'; // Example DID for Alice
+export const ADMIN_DID = '5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty';     // Example DID for Bob
+export const CONTRIBUTOR_DID = '5FLSigC9HGRKVhB9FiEo4Y3koPsNmBmLJbpXg2mp1hXcS59Y'; // Example DID for Charlie
+export const CONTRIBUTOR_DID_URI = 'did:kilt:4p8Azs17Bod3LMHHoVWK3KHzbmKicnPpF28b96c6HYApfFu8';
+
+// --- State Management ---
+const STATE_FILE_PATH = path.join(__dirname, 'e2e-state.json');
+
+export function readState(): Record<string, any> {
+    if (fs.existsSync(STATE_FILE_PATH)) {
+        const fileContent = fs.readFileSync(STATE_FILE_PATH, 'utf-8');
+        return JSON.parse(fileContent);
+    }
+    return {}; // Return empty object if file doesn't exist
+}
+
+export function writeState(newState: Record<string, any>): void {
+    const currentState = readState();
+    const updatedState = { ...currentState, ...newState };
+    fs.writeFileSync(STATE_FILE_PATH, JSON.stringify(updatedState, null, 2));
+    console.log(`✅ State updated in ${STATE_FILE_PATH}`);
+}
+
+const KEY_STATE_FILE_PATH = path.join(__dirname, 'e2e-keys.json');
+
+export function readKeyState(): Record<string, any> {
+    if (fs.existsSync(KEY_STATE_FILE_PATH)) {
+        const fileContent = fs.readFileSync(KEY_STATE_FILE_PATH, 'utf-8');
+        return JSON.parse(fileContent);
+    }
+    return {};
+}
+
+export function writeKeyState(newKeyState: Record<string, any>): void {
+    const currentState = readKeyState();
+    const updatedState = { ...currentState, ...newKeyState };
+    fs.writeFileSync(KEY_STATE_FILE_PATH, JSON.stringify(updatedState, null, 2));
+    console.log(`✅ Key state updated in ${KEY_STATE_FILE_PATH}`);
+}
+
+// --- Client Setup Function ---
+export async function setup() {
+    await cryptoWaitReady();
+    console.log('Crypto WASM initialized.');
+
+    if (!PINATA_JWT) {
+        throw new Error("FATAL: PINATA_JWT environment variable not set.");
+    }
+
+    // Initialize one DID resolver for all clients
+    const kiltResolver = new KiltDidResolver(KILT_ENDPOINT);
+    await kiltResolver.connect();
+
+    // Create a signer for each role
+    const managerSigner = new KeyringSigner(MANAGER_SEED);
+    const adminSigner = new KeyringSigner(ADMIN_SEED);
+    const contributorSigner = new KeyringSigner(CONTRIBUTOR_SEED);
+
+    // Create a client instance for each role
+    const managerClient = new AssetDidCommClient({
+        storageAdapter: new PinataStorageAdapter({ jwt: PINATA_JWT, publicGateway: `https://${PINATA_GATEWAY}/ipfs` }),
+        didResolver: kiltResolver,
+        signer: managerSigner,
+        rpcEndpoint: RPC_ENDPOINT
+    });
+
+    const adminClient = new AssetDidCommClient({
+        storageAdapter: new PinataStorageAdapter({ jwt: PINATA_JWT, publicGateway: `https://${PINATA_GATEWAY}/ipfs` }),
+        didResolver: kiltResolver,
+        signer: adminSigner,
+        rpcEndpoint: RPC_ENDPOINT
+    });
+
+    const contributorClient = new AssetDidCommClient({
+        storageAdapter: new PinataStorageAdapter({ jwt: PINATA_JWT, publicGateway: `https://${PINATA_GATEWAY}/ipfs` }),
+        didResolver: kiltResolver,
+        signer: contributorSigner,
+        rpcEndpoint: RPC_ENDPOINT
+    });
+
+    // Connect all clients to the node
+    console.log("\n--- Connecting clients to the node ---");
+    await Promise.all([
+        managerClient.connect(),
+        adminClient.connect(),
+        contributorClient.connect()
+    ]);
+    console.log("All clients connected.");
+
+    const disconnectAll = async () => {
+        console.log("\n--- Tearing down clients ---");
+        await Promise.all([
+            managerClient.disconnect(),
+            adminClient.disconnect(),
+            contributorClient.disconnect()
+        ]);
+        await kiltResolver.disconnect();
+    };
+
+    return {
+        managerClient,
+        adminClient,
+        contributorClient,
+        disconnectAll,
+    };
+}
+
+
+============================================================
+FILE: e2e-keys.json
+============================================================
+{
+  "83196158930": {
+    "crv": "X25519",
+    "x": "QE5KL9DR8QIFmfTvjE0v-7KGO86UmOautGzqyPwyhQU",
+    "kty": "OKP",
+    "use": "enc",
+    "kid": "83196158930"
+  }
+}
+
+
+============================================================
+FILE: e2e-state.json
+============================================================
+{
+  "namespaceId": 392352452,
+  "bucketId": 19,
+  "bucketPkJwk": {
+    "crv": "X25519",
+    "x": "QE5KL9DR8QIFmfTvjE0v-7KGO86UmOautGzqyPwyhQU",
+    "kty": "OKP",
+    "use": "enc",
+    "kid": "83196158930"
+  },
+  "bucketSkJwk": {
+    "crv": "X25519",
+    "d": "wNSVPBlEj2tqgpcs1ia1COTsJ9yMP9kH0CEW3IJg_ko",
+    "x": "QE5KL9DR8QIFmfTvjE0v-7KGO86UmOautGzqyPwyhQU",
+    "kty": "OKP",
+    "use": "enc",
+    "kid": "83196158930"
+  }
+}
+
+
